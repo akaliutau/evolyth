@@ -1,0 +1,5 @@
+# Extra requirements to test training code before running in the cloud
+# NOTE: this is not included into evolyth package
+torch>=2.2,<3
+torchvision>=0.17,<1
+numpy>=1.26,<3

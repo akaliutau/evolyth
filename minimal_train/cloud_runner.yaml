@@ -1,0 +1,28 @@
+name: minimal-train
+project_id: ${PROJECT_ID}
+region: ${REGION}
+bucket: ${BUCKET_NAME}
+artifact_repo: ${AR_REPO}
+service_account: ${SA_EMAIL}
+files:
+  include: ["train.py", "requirements.txt", "src/**"]
+  required: ["train.py", "requirements.txt"]
+runtime:
+  base_image: pytorch/pytorch:2.3.1-cuda12.1-cudnn8-runtime
+  requirements: requirements.txt
+  command: ["python", "train.py"]
+cloud_run:
+  gpu: 1
+  gpu_type: nvidia-l4
+  cpu: 4
+  memory: 16Gi
+  tasks: 1
+  parallelism: 1
+  max_retries: 0
+  task_timeout: 3600s
+artifacts:
+  container_dir: /workspace/artifacts
+  gcs_prefix: gs://${BUCKET_NAME}/acr-runs/minimal-train
+  local_dir: ./artifacts/minimal-train-latest
+env:
+  PYTHONUNBUFFERED: "1"

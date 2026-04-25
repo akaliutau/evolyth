@@ -1,0 +1,64 @@
+# Generic training/test job spec for application_cloud_runner.py.
+# Values can reference environment variables, e.g. ${PROJECT_ID}.
+name: torch-train
+project_id: ${PROJECT_ID}
+region: ${REGION}
+bucket: ${BUCKET_NAME}
+artifact_repo: ${AR_REPO}
+service_account: ${SA_EMAIL}
+
+files:
+  # Only these files enter the container build context.
+  include:
+    - train.py
+    - src/**
+    - configs/**
+    - requirements.txt
+    - pyproject.toml
+  required:
+    - train.py
+    - requirements.txt
+  exclude:
+    - data/**
+    - artifacts/**
+    - checkpoints/**
+    - '*.pt'
+    - '*.pth'
+  # Optional reproducibility guard. Use sha256:<hex> or <hex>.
+  hashes: {}
+
+runtime:
+  # GPU-friendly default used by the generated Dockerfile. Override if needed.
+  base_image: pytorch/pytorch:2.3.1-cuda12.1-cudnn8-runtime
+  requirements: requirements.txt
+  # The command runs inside /workspace/app. Write artifacts to $ACR_ARTIFACT_DIR.
+  command: ["python", "train.py"]
+  # Optional apt packages for custom training code.
+  apt_packages: []
+  extra_pip: []
+
+cloud_run:
+  # Enforced by the runner for this implementation.
+  gpu: 1
+  gpu_type: nvidia-l4
+  cpu: 4
+  memory: 16Gi
+  tasks: 1
+  parallelism: 1
+  max_retries: 0
+  # Current Cloud Run GPU jobs cap task timeout at 3600s.
+  task_timeout: 3600s
+
+artifacts:
+  # Container-side directory uploaded after the command exits, even on failure.
+  container_dir: /workspace/artifacts
+  # Cloud output prefix. The runner appends /<run_id>.
+  gcs_prefix: gs://${BUCKET_NAME}/training-runs/torch-train
+  # Local output directory. The runner appends nothing if explicitly set.
+  # Often overridden by --local-output-dir from the parent pipeline.
+  local_dir: ./artifacts/latest
+
+env:
+  # Stable defaults baked into the job. Per-run overrides go via --env KEY=VALUE.
+  WANDB_MODE: disabled
+  PYTHONUNBUFFERED: "1"

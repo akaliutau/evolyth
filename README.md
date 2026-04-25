@@ -26,7 +26,7 @@ pip install -r requirements.txt
 
 A compact implementation of the stable self-evolving software loop for model architecture research problems.
 
-The only user-facing entry point is a Research Problem (RP) folder. The RP must contain:
+The only user-facing entry point is a Research Problem (RP) folder. The RP must contain (all the rest files if any must be hidden from model):
 
 ```text
 goal_prompt.md
@@ -48,6 +48,8 @@ python -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
 ```
+
+Install extra requirements 
 
 Setup and configure the Caude Code
 

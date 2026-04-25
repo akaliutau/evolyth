@@ -3,10 +3,9 @@ from __future__ import annotations
 import abc
 import asyncio
 import json
-import shlex
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any
 
 from .rp import ResearchProblem
 
@@ -46,33 +45,6 @@ class NoopAgent(MutationAgent):
             hypothesis="Establish a valid baseline before branching.",
             changed_files=[],
         )
-
-
-class ExternalCommandAgent(MutationAgent):
-    """Adapter for any LLM/script that returns JSON.
-
-    The command receives JSON on stdin:
-      {rp_path, mutable_file, context, current_model}
-
-    It may either edit the workspace directly or return {"model_py": "..."}.
-    """
-
-    def __init__(self, command: str | list[str], timeout_s: int | None = None):
-        self.command = shlex.split(command) if isinstance(command, str) else list(command)
-        self.timeout_s = timeout_s
-
-    async def mutate(self, rp: ResearchProblem, context: str) -> MutationResult:
-        payload = {
-            "rp_path": str(rp.path),
-            "mutable_file": rp.mutable_file,
-            "context": context,
-            "current_model": rp.model_path.read_text(encoding="utf-8"),
-        }
-        out = await _run_json_command(self.command, payload, cwd=rp.path, timeout_s=self.timeout_s)
-        if out.get("model_py"):
-            rp.model_path.write_text(str(out["model_py"]), encoding="utf-8")
-        out.setdefault("raw_output", json.dumps(out))
-        return MutationResult.from_dict(out)
 
 
 class ClaudeCodeAgent(MutationAgent):
@@ -127,10 +99,6 @@ def make_agent(kind: str, *, command: str | None = None, timeout_s: int | None =
         return NoopAgent()
     if kind == "claude-code":
         return ClaudeCodeAgent(timeout_s=timeout_s)
-    if kind == "external-command":
-        if not command:
-            raise ValueError("external-command agent requires --agent-command")
-        return ExternalCommandAgent(command, timeout_s=timeout_s)
     raise ValueError(f"Unknown agent kind: {kind}")
 
 
@@ -214,7 +182,7 @@ def _parse_jsonish(text: str) -> dict[str, Any]:
 
     start = text.find("{")
     end = text.rfind("}")
-    if start >= 0 and end > start:
+    if 0 <= start < end:
         parsed = json.loads(text[start : end + 1])
         return parsed if isinstance(parsed, dict) else {"result": parsed}
     raise ValueError(f"Could not parse JSON output: {text[:1000]}")
