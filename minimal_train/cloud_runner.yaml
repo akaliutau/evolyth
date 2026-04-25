@@ -4,13 +4,25 @@ region: ${REGION}
 bucket: ${BUCKET_NAME}
 artifact_repo: ${AR_REPO}
 service_account: ${SA_EMAIL}
+image:
+  name: acr-minimal-runner
+  tag: latest
+build:
+  base_image: python:3.12-slim
+  requirements: requirements.txt
 files:
   include: ["train.py", "requirements.txt", "src/**"]
   required: ["train.py", "requirements.txt"]
+source:
+  gcs_prefix: gs://${BUCKET_NAME}/acr-sources/minimal-train
 runtime:
-  base_image: pytorch/pytorch:2.3.1-cuda12.1-cudnn8-runtime
-  requirements: requirements.txt
   command: ["python", "train.py"]
+  workdir: /workspace/app
+# Optional; override with --dataset gs://bucket/path when needed.
+# dataset:
+#   uri: gs://${BUCKET_NAME}/datasets/minimal
+#   container_dir: /workspace/dataset
+#   unpack: auto
 cloud_run:
   gpu: 1
   gpu_type: nvidia-l4

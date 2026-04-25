@@ -1,9 +1,15 @@
 #!/usr/bin/env python3
-"""Application Cloud Runner: build, run, observe, sync, and clean up Cloud Run GPU jobs.
+"""Application Cloud Runner: upload source, create a Cloud Run GPU Job, observe, sync, clean up.
 
-This is the only local entry point. It is intentionally JSONL-friendly so an
-external Python pipeline can launch it with asyncio.create_subprocess_exec and
-observe progress from stdout.
+Actual runs do not build Docker images. The stable runner image is built separately
+with deploy_runner_image.py from a base image plus requirements.txt. Each run:
+  1. validates an external training repo against the YAML spec,
+  2. packs selected sources into a tarball,
+  3. uploads the tarball to GCS,
+  4. creates a fresh Cloud Run Job using the prebuilt runner image,
+  5. executes and polls until terminal state/timeout,
+  6. syncs artifacts and grouped logs back locally,
+  7. deletes the Cloud Run Job and temporary source upload on success.
 """
 from __future__ import annotations
 
@@ -17,6 +23,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tarfile
 import tempfile
 import time
 import uuid
@@ -26,10 +33,9 @@ from typing import Any, Iterable
 
 try:
     import yaml  # type: ignore
-except Exception:  # pragma: no cover - surfaced in load_yaml
+except Exception:  # pragma: no cover
     yaml = None
 
-ROOT = pathlib.Path(__file__).resolve().parent
 DEFAULT_EXCLUDES = [
     ".git/**",
     ".venv/**",
@@ -48,7 +54,31 @@ DEFAULT_EXCLUDES = [
     "artifacts/**",
     "outputs/**",
     "output/**",
+    "checkpoints/**",
 ]
+
+EVENT_ACRONYMS = {
+    "artifact_sync_done": "SYN",
+    "artifact_sync_failed": "ERR",
+    "cleanup_done": "CLN",
+    "cleanup_job_skipped": "CLN",
+    "cmd_finish": "CMD",
+    "cmd_output": "OUT",
+    "cmd_start": "CMD",
+    "execution_started": "EXE",
+    "execution_state": "STA",
+    "execution_timeout": "TMO",
+    "files_validated": "VAL",
+    "logs_collected": "LOG",
+    "runner_error": "ERR",
+    "runner_interrupted": "INT",
+    "run_resolved": "RUN",
+    "source_packed": "SRC",
+    "source_uploaded": "SRC",
+    "source_upload_deleted": "CLN",
+}
+
+LOG_FORMAT = "text"
 
 
 class RunnerError(RuntimeError):
@@ -70,8 +100,69 @@ def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def short_ts() -> str:
+    return datetime.now(timezone.utc).replace(microsecond=0).strftime("%Y-%m-%dT%H:%M:%S")
+
+
+def compact(value: Any, limit: int = 180) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, (dict, list)):
+        text = json.dumps(value, sort_keys=True)
+    else:
+        text = str(value)
+    text = re.sub(r"\s+", " ", text).strip()
+    if len(text) > limit:
+        return text[: limit - 1] + "…"
+    return text
+
+
+def event_message(event: str, fields: dict[str, Any]) -> str:
+    if "line" in fields:
+        return str(fields["line"])
+    if event == "cmd_start":
+        return "$ " + " ".join(str(x) for x in fields.get("cmd", []))
+    if event == "cmd_finish":
+        return f"rc={fields.get('returncode')} {' '.join(str(x) for x in fields.get('cmd', [])[:4])}"
+    if event == "run_resolved":
+        return f"run_id={fields.get('run_id')} job={fields.get('job_name')} out={fields.get('output_gcs_uri')}"
+    if event == "files_validated":
+        return f"{fields.get('count')} source files validated"
+    if event == "source_packed":
+        return f"{fields.get('count')} files -> {fields.get('path')}"
+    if event == "source_uploaded":
+        return str(fields.get("source_gcs_uri"))
+    if event == "execution_state":
+        msg = compact(fields.get("message"), 220)
+        return f"{fields.get('execution_name')} {fields.get('state')}" + (f" {msg}" if msg else "")
+    if event == "execution_started":
+        return str(fields.get("execution_name"))
+    if event == "logs_collected":
+        return f"{fields.get('entries')} entries -> {fields.get('path')}"
+    if event == "artifact_sync_done":
+        return f"{fields.get('output_gcs_uri')} -> {fields.get('local_output_dir')}"
+    if event == "artifact_sync_failed":
+        return f"rc={fields.get('returncode')} {fields.get('output_gcs_uri')}"
+    if event == "source_upload_deleted":
+        return str(fields.get("source_gcs_uri"))
+    if event == "cleanup_done":
+        return f"job={fields.get('job_name')}"
+    if event == "runner_error":
+        return f"exit={fields.get('exit_code')} {fields.get('message')}"
+    parts = []
+    for k, v in sorted(fields.items()):
+        if k == "cmd":
+            continue
+        parts.append(f"{k}={compact(v, 100)}")
+    return " ".join(parts)
+
+
 def emit(event: str, **fields: Any) -> None:
-    print(json.dumps({"ts": utc_now(), "event": event, **fields}, sort_keys=True), flush=True)
+    if LOG_FORMAT == "json":
+        print(json.dumps({"ts": utc_now(), "event": event, **fields}, sort_keys=True), flush=True)
+        return
+    code = EVENT_ACRONYMS.get(event, event[:3].upper())
+    print(f"{short_ts()} {code} {event_message(event, fields)}", flush=True)
 
 
 def load_dotenv(path: pathlib.Path) -> None:
@@ -167,9 +258,7 @@ def memory_to_gib(memory: str) -> float | None:
         return None
     value = float(m.group(1))
     unit = m.group(2).lower()
-    if unit in {"mi", "m"}:
-        return value / 1024.0
-    return value
+    return value / 1024.0 if unit in {"mi", "m"} else value
 
 
 def timeout_to_seconds(value: str | int) -> int:
@@ -186,8 +275,7 @@ def timeout_to_seconds(value: str | int) -> int:
 
 
 def timeout_for_gcloud(value: str | int) -> str:
-    seconds = timeout_to_seconds(value)
-    return f"{seconds}s"
+    return f"{timeout_to_seconds(value)}s"
 
 
 def run_cmd(args: list[str], *, check: bool = True, stream: bool = False) -> CommandResult:
@@ -200,7 +288,8 @@ def run_cmd(args: list[str], *, check: bool = True, stream: bool = False) -> Com
             line = line.rstrip("\n")
             tail.append(line)
             tail = tail[-80:]
-            emit("cmd_output", line=line)
+            if line:
+                emit("cmd_output", line=line)
         rc = proc.wait()
         emit("cmd_finish", cmd=args, returncode=rc)
         if check and rc != 0:
@@ -226,14 +315,13 @@ def run_json(args: list[str], *, check: bool = True) -> Any:
     try:
         return json.loads(result.stdout)
     except json.JSONDecodeError:
-        emit("json_parse_failed", stdout=result.stdout[-2000:], stderr=result.stderr[-2000:])
         if check:
-            raise
+            raise RunnerError(f"Expected JSON from command but got: {result.stdout[-2000:]}", 2)
         return None
 
 
-def normalize_rel(path: pathlib.Path) -> str:
-    return path.as_posix().lstrip("./")
+def normalize_rel(path: pathlib.Path | str) -> str:
+    return pathlib.PurePosixPath(str(path).replace(os.sep, "/")).as_posix().lstrip("./")
 
 
 def match_pattern(rel: str, pattern: str) -> bool:
@@ -281,7 +369,7 @@ def collect_files(app_dir: pathlib.Path, spec: dict[str, Any]) -> tuple[list[pat
 
     selected_rels = {normalize_rel(p.relative_to(app_dir)) for p in selected}
     for rel_raw in required:
-        rel = normalize_rel(pathlib.Path(str(rel_raw)))
+        rel = normalize_rel(rel_raw)
         path = app_dir / rel
         if not path.exists():
             raise RunnerError(f"Required file is missing: {rel}", 64)
@@ -290,7 +378,7 @@ def collect_files(app_dir: pathlib.Path, spec: dict[str, Any]) -> tuple[list[pat
         else:
             present = rel in selected_rels
         if not present:
-            raise RunnerError(f"Required path exists but is excluded from build context: {rel}", 64)
+            raise RunnerError(f"Required path exists but is excluded from uploaded source bundle: {rel}", 64)
 
     manifest: list[dict[str, Any]] = []
     for path in sorted(selected):
@@ -302,61 +390,23 @@ def collect_files(app_dir: pathlib.Path, spec: dict[str, Any]) -> tuple[list[pat
         manifest.append({"path": rel, "size": path.stat().st_size, "sha256": digest})
 
     if not manifest:
-        raise RunnerError("No files selected for build context. Check spec.files.include/exclude.", 64)
+        raise RunnerError("No files selected for source bundle. Check spec.files.include/exclude.", 64)
     emit("files_validated", count=len(manifest), required=required)
     return selected, manifest
 
 
-def copy_build_context(app_dir: pathlib.Path, selected: list[pathlib.Path], manifest: list[dict[str, Any]], spec: dict[str, Any], build_dir: pathlib.Path) -> None:
-    for src in selected:
-        rel = src.relative_to(app_dir)
-        dst = build_dir / rel
-        dst.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(src, dst)
-    acr_dir = build_dir / ".acr"
-    acr_dir.mkdir(parents=True, exist_ok=True)
-    (acr_dir / "file_manifest.json").write_text(json.dumps(manifest, indent=2, sort_keys=True), encoding="utf-8")
-    (acr_dir / "run_spec_resolved.json").write_text(json.dumps(spec, indent=2, sort_keys=True), encoding="utf-8")
-    opt_dir = build_dir / ".acr_runtime"
-    opt_dir.mkdir(parents=True, exist_ok=True)
-    shutil.copy2(ROOT / "cloud_job.py", opt_dir / "cloud_job.py")
-    shutil.copy2(ROOT / "cloud_entrypoint.sh", opt_dir / "cloud_entrypoint.sh")
-
-
-def write_dockerfile(build_dir: pathlib.Path, spec: dict[str, Any]) -> None:
-    runtime = spec.get("runtime") or {}
-    base_image = runtime.get("base_image", "pytorch/pytorch:2.3.1-cuda12.1-cudnn8-runtime")
-    requirements = runtime.get("requirements", "requirements.txt")
-    apt_packages = runtime.get("apt_packages") or []
-    extra_pip = runtime.get("extra_pip") or []
-    if not isinstance(apt_packages, list) or not isinstance(extra_pip, list):
-        raise RunnerError("runtime.apt_packages and runtime.extra_pip must be lists", 64)
-
-    lines = [
-        f"FROM {base_image}",
-        "ENV PYTHONUNBUFFERED=1 PIP_NO_CACHE_DIR=1 ACR_WORKDIR=/workspace/app ACR_ARTIFACT_DIR=/workspace/artifacts",
-        "WORKDIR /workspace/app",
-    ]
-    if apt_packages:
-        quoted = " ".join(str(p) for p in apt_packages)
-        lines.append(
-            "RUN apt-get update && apt-get install -y --no-install-recommends "
-            + quoted
-            + " && rm -rf /var/lib/apt/lists/*"
-        )
-    lines += [
-        "COPY . /workspace/app",
-        "RUN mkdir -p /opt/acr /workspace/artifacts && cp /workspace/app/.acr_runtime/cloud_job.py /opt/acr/cloud_job.py && cp /workspace/app/.acr_runtime/cloud_entrypoint.sh /opt/acr/cloud_entrypoint.sh && chmod +x /opt/acr/cloud_entrypoint.sh",
-        "RUN python -m pip install --upgrade pip && python -m pip install --no-cache-dir google-cloud-storage pyyaml",
-    ]
-    if requirements:
-        lines.append(f"RUN if [ -f {requirements} ]; then python -m pip install --no-cache-dir -r {requirements}; fi")
-    if extra_pip:
-        lines.append("RUN python -m pip install --no-cache-dir " + " ".join(str(p) for p in extra_pip))
-    lines += [
-        "ENTRYPOINT [\"/opt/acr/cloud_entrypoint.sh\"]",
-    ]
-    (build_dir / "Dockerfile").write_text("\n".join(lines) + "\n", encoding="utf-8")
+def pack_source(app_dir: pathlib.Path, selected: list[pathlib.Path], manifest: list[dict[str, Any]], spec: dict[str, Any], out_tar: pathlib.Path) -> None:
+    with tarfile.open(out_tar, "w:gz") as tar:
+        for src in selected:
+            rel = normalize_rel(src.relative_to(app_dir))
+            tar.add(src, arcname=rel, recursive=False)
+        with tempfile.TemporaryDirectory(prefix="acr-meta-") as td:
+            meta = pathlib.Path(td) / ".acr"
+            meta.mkdir(parents=True)
+            (meta / "file_manifest.json").write_text(json.dumps(manifest, indent=2, sort_keys=True), encoding="utf-8")
+            (meta / "run_spec_resolved.json").write_text(json.dumps(spec, indent=2, sort_keys=True), encoding="utf-8")
+            tar.add(meta, arcname=".acr")
+    emit("source_packed", path=str(out_tar), count=len(manifest), bytes=out_tar.stat().st_size)
 
 
 def resolve_command(spec: dict[str, Any]) -> list[str]:
@@ -396,6 +446,46 @@ def validate_cloud_run_shape(spec: dict[str, Any]) -> dict[str, Any]:
 
 def image_uri(region: str, project_id: str, repo: str, image_name: str, tag: str) -> str:
     return f"{region}-docker.pkg.dev/{project_id}/{repo}/{image_name}:{tag}"
+
+
+def resolve_runner_image(spec: dict[str, Any], project_id: str, region: str, repo: str, default_name: str) -> str:
+    image = spec.get("image") or spec.get("runner_image") or {}
+    if isinstance(image, str):
+        return image
+    if not isinstance(image, dict):
+        raise RunnerError("spec.image must be a string URI or mapping", 64)
+    uri = image.get("uri") or os.environ.get("RUNNER_IMAGE_URI")
+    if uri:
+        return str(uri)
+    name = str(image.get("name") or f"{default_name}-runner")
+    tag = str(image.get("tag") or os.environ.get("RUNNER_IMAGE_TAG") or "latest")
+    return image_uri(region, project_id, repo, safe_name(name, 60), tag)
+
+
+def resolve_dataset(spec: dict[str, Any], cli_dataset: str | None) -> dict[str, str] | None:
+    ds = spec.get("dataset")
+    if cli_dataset:
+        ds = {"uri": cli_dataset}
+    if not ds:
+        return None
+    if isinstance(ds, str):
+        ds = {"uri": ds}
+    if not isinstance(ds, dict):
+        raise RunnerError("dataset must be a gs:// URI string or mapping", 64)
+    uri = str(ds.get("uri") or "").strip()
+    if not uri:
+        return None
+    if not uri.startswith("gs://"):
+        raise RunnerError("dataset.uri must be a gs:// URI", 64)
+    mode = str(ds.get("mode") or "auto").lower()
+    if mode not in {"auto", "prefix", "object"}:
+        raise RunnerError("dataset.mode must be one of: auto, prefix, object", 64)
+    return {
+        "uri": uri,
+        "container_dir": str(ds.get("container_dir") or "/workspace/dataset"),
+        "unpack": str(ds.get("unpack") or "auto"),
+        "mode": mode,
+    }
 
 
 def newest_execution(project_id: str, region: str, job_name: str) -> str:
@@ -443,7 +533,6 @@ def parse_execution_state(data: dict[str, Any]) -> tuple[str, str]:
                 return "SUCCEEDED", msg or reason
             if low in {"false", "condition_failed", "failed"}:
                 return "FAILED", msg or reason
-    observed = str(status.get("observedGeneration") or "")
     completion = status.get("completionTime") or status.get("completionTimestamp") or data.get("completionTime")
     failed = status.get("failedCount") or status.get("failed")
     succeeded = status.get("succeededCount") or status.get("succeeded")
@@ -453,7 +542,7 @@ def parse_execution_state(data: dict[str, Any]) -> tuple[str, str]:
         return "SUCCEEDED", "; ".join(messages)
     if completion:
         return "COMPLETED_UNKNOWN", "; ".join(messages)
-    return "RUNNING", "; ".join(messages) or observed
+    return "RUNNING", "; ".join(messages)
 
 
 def describe_execution(project_id: str, region: str, execution_name: str) -> dict[str, Any]:
@@ -466,7 +555,42 @@ def describe_execution(project_id: str, region: str, execution_name: str) -> dic
     return data
 
 
-def collect_logs(project_id: str, region: str, job_name: str, execution_name: str, out_dir: pathlib.Path, limit: int = 300) -> None:
+def parse_cloud_payload(entry: dict[str, Any]) -> tuple[str, str, str]:
+    ts = str(entry.get("timestamp") or entry.get("receiveTimestamp") or "")[:19]
+    payload = entry.get("jsonPayload")
+    if isinstance(payload, dict):
+        event = str(payload.get("event") or "json_payload")
+        line = payload.get("line") or payload.get("message")
+        if line is None:
+            rest = {k: v for k, v in payload.items() if k not in {"event", "ts"}}
+            line = json.dumps(rest, sort_keys=True) if rest else ""
+        return ts, event, str(line)
+    text = entry.get("textPayload")
+    if isinstance(text, str):
+        stripped = text.strip()
+        if stripped.startswith("{") and stripped.endswith("}"):
+            try:
+                data = json.loads(stripped)
+                event = str(data.get("event") or "json_payload")
+                line = data.get("line") or data.get("message")
+                if line is None:
+                    rest = {k: v for k, v in data.items() if k not in {"event", "ts"}}
+                    line = json.dumps(rest, sort_keys=True) if rest else ""
+                return ts, event, str(line)
+            except json.JSONDecodeError:
+                pass
+        return ts, "cmd_output", stripped
+    proto = entry.get("protoPayload")
+    if proto is not None:
+        return ts, "proto_payload", json.dumps(proto, sort_keys=True)
+    return ts, "unknown", json.dumps(entry, sort_keys=True)
+
+
+def sanitize_event_name(event: str) -> str:
+    return safe_name(event.replace("_", "-"), 80).replace("-", "_")
+
+
+def collect_logs(project_id: str, region: str, job_name: str, execution_name: str, out_dir: pathlib.Path, limit: int = 500) -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
     filters = [
         f'resource.type="cloud_run_job" AND resource.labels.job_name="{job_name}" AND labels."run.googleapis.com/execution_name"="{execution_name}"',
@@ -481,16 +605,21 @@ def collect_logs(project_id: str, region: str, job_name: str, execution_name: st
         if isinstance(result, list) and result:
             entries = result
             break
-    (out_dir / "cloud_logging_entries.json").write_text(json.dumps(entries, indent=2, sort_keys=True), encoding="utf-8")
-    text_lines: list[str] = []
+
+    grouped: dict[str, list[tuple[str, str]]] = {}
     if isinstance(entries, list):
-        for e in reversed(entries):
-            ts = e.get("timestamp") or e.get("receiveTimestamp") or ""
-            payload = e.get("textPayload") or e.get("jsonPayload") or e.get("protoPayload") or ""
-            if isinstance(payload, (dict, list)):
-                payload = json.dumps(payload, sort_keys=True)
-            text_lines.append(f"{ts} {payload}")
-    (out_dir / "cloud_logging_tail.txt").write_text("\n".join(text_lines) + ("\n" if text_lines else ""), encoding="utf-8")
+        for e in entries:
+            if not isinstance(e, dict):
+                continue
+            ts, event, line = parse_cloud_payload(e)
+            if not ts:
+                ts = short_ts()
+            grouped.setdefault(event, []).append((ts, line))
+    for event, rows in grouped.items():
+        rows.sort(key=lambda x: x[0])
+        code = EVENT_ACRONYMS.get(event, event[:3].upper())
+        path = out_dir / f"{sanitize_event_name(event)}.log"
+        path.write_text("".join(f"{ts} {code} {line}\n" for ts, line in rows), encoding="utf-8")
     emit("logs_collected", entries=len(entries) if isinstance(entries, list) else 0, path=str(out_dir))
 
 
@@ -508,19 +637,30 @@ def write_summary(path: pathlib.Path, summary: dict[str, Any]) -> None:
     path.write_text(json.dumps(summary, indent=2, sort_keys=True), encoding="utf-8")
 
 
+def delete_gcs_object(uri: str, project_id: str) -> None:
+    run_cmd(["gcloud", "storage", "rm", uri, f"--project={project_id}"], check=False, stream=True)
+    emit("source_upload_deleted", source_gcs_uri=uri)
+
+
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Build and run a local Python app as a Cloud Run L4 GPU Job.")
-    parser.add_argument("--app-dir", required=True, help="Path to the local folder containing the training/test code")
-    parser.add_argument("--spec", required=True, help="YAML spec describing files, runtime command, cloud resources, and artifacts")
+    parser = argparse.ArgumentParser(description="Run an external Python repo as a Cloud Run L4 GPU Job without rebuilding the image.")
+    parser.add_argument("--app-dir", required=True, help="Path to the external local repo/folder containing the training/test code")
+    parser.add_argument("--spec", required=True, help="YAML spec describing source files, runner image, command, cloud resources, and artifacts")
     parser.add_argument("--env", action="append", default=[], help="Run-specific environment override passed to the Cloud Run execution; repeat KEY=VALUE")
     parser.add_argument("--env-file", action="append", default=[], help="File with KEY=VALUE lines to pass as run-specific env overrides")
+    parser.add_argument("--dataset", default=None, help="Optional gs:// dataset URI overriding spec.dataset.uri")
     parser.add_argument("--local-output-dir", default=None, help="Where to sync artifacts after the job finishes")
     parser.add_argument("--timeout-seconds", type=int, default=None, help="Local orchestration timeout; defaults to cloud_run.task_timeout + 15 minutes")
     parser.add_argument("--poll-interval-seconds", type=int, default=15, help="Execution polling interval")
-    parser.add_argument("--delete-image", action="store_true", help="Explicitly delete the pushed image tag after completion. Default relies on Artifact Registry retention.")
     parser.add_argument("--keep-job-on-failure", action="store_true", help="Keep the Cloud Run Job resource if execution fails")
     parser.add_argument("--no-cleanup-job", action="store_true", help="Do not delete the Cloud Run Job resource after execution")
+    parser.add_argument("--keep-source-upload", action="store_true", help="Keep the uploaded source tarball in GCS after success")
+    parser.add_argument("--delete-source-on-failure", action="store_true", help="Also delete uploaded source tarball if the job fails")
+    parser.add_argument("--log-format", choices=["text", "json"], default="text", help="stdout event format; text is concise, json is machine-readable")
     args = parser.parse_args()
+
+    global LOG_FORMAT
+    LOG_FORMAT = args.log_format
 
     app_dir = pathlib.Path(args.app_dir).resolve()
     spec_path = pathlib.Path(args.spec).resolve()
@@ -529,8 +669,9 @@ def main() -> int:
     if not spec_path.exists():
         raise RunnerError(f"spec not found: {spec_path}", 64)
 
-    load_dotenv(app_dir / ".env")
     load_dotenv(pathlib.Path.cwd() / ".env")
+    load_dotenv(spec_path.parent / ".env")
+    load_dotenv(app_dir / ".env")
     spec = expand_env(load_yaml(spec_path))
 
     project_id = env_get(spec, "project_id", "PROJECT_ID")
@@ -541,14 +682,16 @@ def main() -> int:
     name = safe_name(str(spec.get("name") or app_dir.name), max_len=36)
     run_id = f"{datetime.now(timezone.utc).strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:8]}"
     job_name = safe_name(f"{name}-{run_id}", max_len=63)
-    tag = run_id
-    img = image_uri(region, project_id, repo, name, tag)
-    output_prefix = ((spec.get("artifacts") or {}).get("gcs_prefix") or f"gs://{bucket}/acr-runs/{name}").rstrip("/")
+    runner_image = resolve_runner_image(spec, project_id, region, repo, default_name=name)
+    source_prefix = str((spec.get("source") or {}).get("gcs_prefix") or f"gs://{bucket}/acr-sources/{name}").rstrip("/")
+    source_gcs_uri = f"{source_prefix}/{run_id}/source.tar.gz"
+    output_prefix = str(((spec.get("artifacts") or {}).get("gcs_prefix") or f"gs://{bucket}/acr-runs/{name}").rstrip("/"))
     output_gcs_uri = f"{output_prefix}/{run_id}"
     local_output_dir = pathlib.Path(args.local_output_dir or ((spec.get("artifacts") or {}).get("local_dir") or f"./artifacts/{run_id}")).resolve()
 
     command = resolve_command(spec)
     cloud = validate_cloud_run_shape(spec)
+    dataset = resolve_dataset(spec, args.dataset)
     task_timeout_seconds = timeout_to_seconds(cloud["task_timeout"])
     orchestration_timeout = args.timeout_seconds or (task_timeout_seconds + 900)
     if args.poll_interval_seconds < 2:
@@ -563,6 +706,7 @@ def main() -> int:
     if not isinstance(spec_env, dict):
         raise RunnerError("spec.env must be a mapping", 64)
     artifact_dir = str((spec.get("artifacts") or {}).get("container_dir") or "/workspace/artifacts")
+    workdir = str((spec.get("runtime") or {}).get("workdir") or "/workspace/app")
     deploy_env: dict[str, Any] = {
         **{str(k): str(v) for k, v in spec_env.items()},
         "PROJECT_ID": project_id,
@@ -570,23 +714,36 @@ def main() -> int:
         "REGION": region,
         "ACR_COMMAND_JSON": json.dumps(command),
         "ACR_ARTIFACT_DIR": artifact_dir,
-        "ACR_WORKDIR": "/workspace/app",
+        "ACR_WORKDIR": workdir,
     }
     execute_env: dict[str, Any] = {
         **run_env,
         "ACR_RUN_ID": run_id,
+        "ACR_SOURCE_GCS_URI": source_gcs_uri,
         "ACR_OUTPUT_GCS_URI": output_gcs_uri,
     }
+    if dataset:
+        execute_env.update({
+            "ACR_DATASET_URI": dataset["uri"],
+            "ACR_DATASET_DIR": dataset["container_dir"],
+            "ACR_DATASET_UNPACK": dataset["unpack"],
+            "ACR_DATASET_MODE": dataset["mode"],
+            "DATASET_URI": dataset["uri"],
+            "DATASET_DIR": dataset["container_dir"],
+        })
 
-    emit("run_resolved", run_id=run_id, job_name=job_name, image_uri=img, output_gcs_uri=output_gcs_uri, local_output_dir=str(local_output_dir))
+    emit("run_resolved", run_id=run_id, job_name=job_name, image_uri=runner_image, source_gcs_uri=source_gcs_uri, output_gcs_uri=output_gcs_uri, local_output_dir=str(local_output_dir))
 
     selected, manifest = collect_files(app_dir, spec)
-    build_tmp = pathlib.Path(tempfile.mkdtemp(prefix="acr-build-"))
+    tmp_dir = pathlib.Path(tempfile.mkdtemp(prefix="acr-source-"))
+    tar_path = tmp_dir / "source.tar.gz"
     summary: dict[str, Any] = {
         "run_id": run_id,
         "job_name": job_name,
         "execution_name": None,
-        "image_uri": img,
+        "image_uri": runner_image,
+        "source_gcs_uri": source_gcs_uri,
+        "dataset": dataset,
         "output_gcs_uri": output_gcs_uri,
         "local_output_dir": str(local_output_dir),
         "status": "initializing",
@@ -595,18 +752,17 @@ def main() -> int:
     delete_job = not args.no_cleanup_job
     execution_name: str | None = None
     terminal_state = "UNKNOWN"
+    job_created = False
     try:
-        copy_build_context(app_dir, selected, manifest, spec, build_tmp)
-        write_dockerfile(build_tmp, spec)
-        emit("build_context_ready", path=str(build_tmp), files=len(manifest))
+        pack_source(app_dir, selected, manifest, spec, tar_path)
+        run_cmd(["gcloud", "storage", "cp", str(tar_path), source_gcs_uri, f"--project={project_id}"], check=True, stream=True)
+        emit("source_uploaded", source_gcs_uri=source_gcs_uri)
 
         run_cmd(["gcloud", "artifacts", "repositories", "describe", repo, f"--location={region}", f"--project={project_id}"], check=True)
-        run_cmd(["gcloud", "builds", "submit", str(build_tmp), "--tag", img, f"--project={project_id}"], check=True, stream=True)
-
         deploy_env_arg = format_gcloud_env(deploy_env)
         create_cmd = [
             "gcloud", "run", "jobs", "create", job_name,
-            "--image", img,
+            "--image", runner_image,
             f"--region={region}",
             f"--project={project_id}",
             "--service-account", service_account,
@@ -623,6 +779,7 @@ def main() -> int:
         if deploy_env_arg:
             create_cmd += ["--set-env-vars", deploy_env_arg]
         run_cmd(create_cmd, check=True, stream=True)
+        job_created = True
 
         execute_cmd = [
             "gcloud", "run", "jobs", "execute", job_name,
@@ -662,14 +819,15 @@ def main() -> int:
             raise RunnerError(f"Cloud Run execution ended with state {terminal_state}: {last_message}", 2 if terminal_state == "FAILED" else 3)
         return 0
     finally:
-        if execution_name and (terminal_state == "FAILED" and args.keep_job_on_failure):
+        failed = terminal_state not in {"SUCCEEDED"}
+        if execution_name and failed and args.keep_job_on_failure:
             emit("cleanup_job_skipped", reason="keep_job_on_failure", job_name=job_name)
-        elif delete_job:
+        elif delete_job and job_created:
             run_cmd(["gcloud", "run", "jobs", "delete", job_name, f"--region={region}", f"--project={project_id}", "--quiet"], check=False, stream=True)
-        if args.delete_image:
-            run_cmd(["gcloud", "artifacts", "docker", "images", "delete", img, f"--project={project_id}", "--quiet", "--delete-tags"], check=False, stream=True)
-        shutil.rmtree(build_tmp, ignore_errors=True)
-        emit("cleanup_done", job_name=job_name, image_deleted=args.delete_image, build_context=str(build_tmp))
+        if (not failed and not args.keep_source_upload) or (failed and args.delete_source_on_failure):
+            delete_gcs_object(source_gcs_uri, project_id)
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+        emit("cleanup_done", job_name=job_name, source_bundle=str(tar_path))
 
 
 if __name__ == "__main__":

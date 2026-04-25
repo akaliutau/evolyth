@@ -20,14 +20,16 @@ fi
 AR_REPO="${AR_REPO:-app-cloud-runner}"
 SA_NAME="${SA_NAME:-app-cloud-runner}"
 SA_EMAIL="${SA_NAME}@${PROJECT_ID}.iam.gserviceaccount.com"
-KEY_FILE_NAME="${SA_NAME}-key.json" 
-RETENTION_DAYS="${RETENTION_DAYS:-3}"
+KEY_FILE_NAME="${SA_NAME}-key.json"
+
+RETENTION_DAYS="${RETENTION_DAYS:-1}"
 KEEP_RECENT="${KEEP_RECENT:-2}"
 REPO_DESCRIPTION="${REPO_DESCRIPTION:-Images for Application Cloud Runner jobs}"
 
 printf '[infra] project=%s region=%s bucket=%s repo=%s service_account=%s\n' \
   "$PROJECT_ID" "$REGION" "$BUCKET_NAME" "$AR_REPO" "$SA_EMAIL"
 
+echo "Setting active GCP Project to $PROJECT_ID..."
 gcloud config set project "$PROJECT_ID" >/dev/null
 
 printf '[infra] Enabling APIs...\n'
@@ -86,9 +88,7 @@ if ! gcloud storage buckets describe "gs://${BUCKET_NAME}" --project="$PROJECT_I
     --uniform-bucket-level-access
 fi
 
-# ==========================================
-# 1. Create the Service Account
-# ==========================================
+
 printf '[infra] Ensuring runtime service account...\n'
 if ! gcloud iam service-accounts describe "$SA_EMAIL" --project="$PROJECT_ID" >/dev/null 2>&1; then
   gcloud iam service-accounts create "$SA_NAME" \
@@ -96,12 +96,10 @@ if ! gcloud iam service-accounts describe "$SA_EMAIL" --project="$PROJECT_ID" >/
     --description="Runtime service account for Application Cloud Runner jobs" \
     --display-name="Application Cloud Runner"
 fi
+
 # create ops are async, wait for eventual update
 sleep 5
 
-# ==========================================
-# 2. Create & Save the API Key (JSON Key)
-# ==========================================
 if [ -f "$KEY_FILE_NAME" ]; then
     echo "✅ API Key already exists locally at ${KEY_FILE_NAME}. Skipping creation to prevent key rotation."
 else
@@ -113,7 +111,6 @@ else
     chmod 600 $KEY_FILE_NAME
     echo "✅ API Key successfully saved and secured: $KEY_FILE_NAME"
 fi
-
 
 printf '[infra] Granting runtime service-account roles...\n'
 for role in roles/logging.logWriter roles/storage.objectAdmin roles/artifactregistry.reader; do
@@ -153,8 +150,3 @@ SA_EMAIL=${SA_EMAIL}
 
 Add these to your runner spec or .env.
 EOF
-
-echo "=========================================="
-echo "Deployment Complete!"
-echo "API Key Path: $(pwd)/${KEY_FILE_NAME}"
-echo "=========================================="
