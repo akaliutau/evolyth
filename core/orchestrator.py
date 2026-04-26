@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import uuid
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -39,6 +40,26 @@ class EvolutionStepResult:
     context_path: str
     workspace_path: str
 
+def _num_or_none(value: Any) -> float | None:
+    try:
+       return None if value in (None, "", "None") else float(value)
+    except (TypeError, ValueError):
+       return None
+
+def _patch_json_object(path: Path, updates: dict[str, Any]) -> None:
+    data: dict[str, Any] = {}
+
+    if path.exists():
+        try:
+           loaded = json.loads(path.read_text(encoding="utf-8"))
+           if isinstance(loaded, dict):
+               data = loaded
+        except Exception:
+            data = {}
+    data.update(updates)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(data, indent=2, sort_keys=True, default=str), encoding="utf-8")
+
 
 class EvolutionOrchestrator:
     """Small autonomous loop: select → mutate → execute → review → queue."""
@@ -66,6 +87,7 @@ class EvolutionOrchestrator:
         return results
 
     async def evolve_one(self) -> EvolutionStepResult:
+        evolution_started = time.monotonic()
         run_id = next_run_id(self.config.arena_root)
         assignment = self._next_assignment()
         queue_item_id = str(assignment.get("queue_item_id") or "")
@@ -111,6 +133,7 @@ class EvolutionOrchestrator:
 
             child_dict = record.to_dict()
             review = await self.reviewer.review(parent, child_dict, context)
+            evolution_time_seconds = round(time.monotonic() - evolution_started, 3)
             record.observation = str(review.get("observation") or record.observation or "")
             record.next_belief = str(review.get("next_belief") or record.next_belief or "")
 
@@ -119,6 +142,11 @@ class EvolutionOrchestrator:
             (run_dir / "context.md").write_text(context, encoding="utf-8")
             (run_dir / "mutation.json").write_text(json.dumps(mutation.__dict__, indent=2, sort_keys=True), encoding="utf-8")
             (run_dir / "ds_review.json").write_text(json.dumps(review, indent=2, sort_keys=True, default=str), encoding="utf-8")
+
+            rnd_metrics = {
+                "evolution_time_seconds": evolution_time_seconds,
+            }
+            _patch_json_object(run_dir / "metrics.json", rnd_metrics)
 
             registered = self.store.register(record)
             queued = self._enqueue_next(record.run_id, review)

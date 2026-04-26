@@ -195,6 +195,7 @@ class ArenaReader:
                     "latency_ms",
                     "train_seconds",
                     "dry_run_passed",
+                    "evolution_time_seconds",
                     "error_type",
                     "observation",
                 ]:
@@ -549,7 +550,7 @@ body.body--dark, body {
   background:
     radial-gradient(circle at 12% 4%, rgba(34, 211, 238, .18), transparent 32rem),
     radial-gradient(circle at 82% 8%, rgba(167, 139, 250, .20), transparent 34rem),
-    linear-gradient(180deg, #25324a 0%, #182235 48%, #111827 100%) !important;
+    linear-gradient(180deg, #35424a 0%, #626262 48%, #414447 100%) !important;
   color: var(--text);
 }
 .evo-page { min-height: 100vh; color: var(--text); }
@@ -624,6 +625,15 @@ body.body--dark, body {
 .q-card { background: transparent; }
 """
 
+def _status_bucket(status: Any) -> str:
+    raw = str(status or "").strip().lower()
+    if raw in {"succeeded", "success", "ok", "passed", "pass", "completed", "complete"}:
+        return "ok"
+    if raw in {"failed", "fail", "error", "errored", "timeout", "timed_out", "cancelled", "canceled"}:
+        return "fail"
+    if "error" in raw or "fail" in raw or "timeout" in raw:
+        return "fail"
+    return "other"
 
 def run_dashboard(arena: str | Path, *, host: str = "127.0.0.1", port: int = 8080, poll_s: float = 1.0, title: str = "AI Evolver Live") -> None:
     try:
@@ -707,9 +717,10 @@ def run_dashboard(arena: str | Path, *, host: str = "127.0.0.1", port: int = 808
 
     def render_top_stats(snapshot: ArenaSnapshot) -> None:
         runs = snapshot.runs
-        succeeded = sum(1 for r in runs if r.status == "succeeded")
-        failed = sum(1 for r in runs if r.status == "failed")
+        succeeded = sum(1 for r in runs if _status_bucket(r.status) == "ok")
+        failed = sum(1 for r in runs if _status_bucket(r.status) == "fail")
         queued = sum(1 for q in snapshot.queue if q.get("status") == "queued")
+        evolution_time = sum(_float(r.data.get("evolution_time_seconds"), 0.0) for r in runs)
         best = snapshot.best_run
         latest = snapshot.latest_run
         ribbon = [
@@ -719,6 +730,7 @@ def run_dashboard(arena: str | Path, *, host: str = "127.0.0.1", port: int = 808
             ("queue", queued, "warn"),
             ("ok/fail", f"{succeeded}/{failed}", "bad" if failed else "good"),
             ("refresh", f"{_ago(state['last_changed'])}", ""),
+            ("evolution time", f"{evolution_time:.0f}s", ""),
         ]
         html_bits = []
         for label, value, tone in ribbon:
@@ -1048,7 +1060,7 @@ def _ago_ts(value: Any) -> str:
 def _short_json(event: dict[str, Any]) -> str:
     try:
         return _clip(json.dumps(event, sort_keys=True, default=str), 160)
-    except Exception:
+    except Exception as e:
         return _clip(str(event), 160)
 
 
