@@ -5,7 +5,7 @@
 <h1 align="center">Evolyth</h1>
 
 <p align="center">
-  <strong>Autonomous, inspectable AI R&amp;D for model architecture evolution.</strong>
+  <strong>Autonomous, explainable AI R&amp;D for model architecture evolution.</strong>
 
 <p align="center">
  <a><img alt="Status" src="https://img.shields.io/badge/status-mvp-orange"></a>
