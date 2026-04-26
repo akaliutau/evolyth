@@ -1,6 +1,7 @@
 # Application Cloud Runner v2
 
-A small, spec-driven runner for executing an external Python training repo as a fresh Google Cloud Run Job with exactly one NVIDIA L4 GPU per job instance.
+A small, spec-driven runner for executing an external Python training repo as a fresh Google Cloud Run Job 
+with exactly one NVIDIA L4 GPU per job instance.
 
 Version 2 separates **runner image deployment** from **per-run source execution**:
 
@@ -123,7 +124,7 @@ runtime:
   workdir: /workspace/app
 
 dataset:
-  uri: gs://${BUCKET_NAME}/datasets/example-dataset
+  uri: gs://${BUCKET_NAME}/datasets/example-dataset/data.tar.gz
   container_dir: /workspace/dataset
   # auto: archives are single objects, other URIs are prefixes/folders.
   # prefix: force folder/prefix download. object: force single-object download.
@@ -145,8 +146,6 @@ artifacts:
 `files.*` is evaluated against the external repo passed to `--app-dir`. The runner validates required files and optional SHA256 hashes before uploading any source.
 
 `dataset` may be omitted. When present, it can point to a GCS prefix/folder, a single file, or a `.tar`, `.tar.gz`, `.tgz`, or `.zip` archive. The cloud launcher downloads it before executing `runtime.command` and sets both `DATASET_DIR` and `DATASET_URI`. By default, `dataset.mode: auto` treats archive-looking URIs as single objects and other URIs as prefixes/folders. Set `dataset.mode: object` for one non-archive file, or `dataset.mode: prefix` for a folder.
-
-If dataset download fails with a 403 mentioning billing, the runner cannot fix it in code: the bucket is owned by a project whose billing account is disabled/closed, or the runtime service account lacks access. Use a bucket in a billing-enabled project and grant the Cloud Run service account at least object read/list access to that bucket.
 
 ## Run once from a parent pipeline
 
@@ -214,7 +213,7 @@ Each line uses second-precision timestamps and the same compact shape:
 2026-04-25T16:09:16 OUT epoch=0 loss=1.0000
 ```
 
-## Async parent integration
+## Async integration
 
 ```python
 import asyncio
@@ -223,9 +222,8 @@ async def run_training():
     proc = await asyncio.create_subprocess_exec(
         "python", "application_cloud_runner.py",
         "--app-dir", "/repos/external-training-project",
-        "--spec", "/pipeline/cloud_runner.yaml",
+        "--spec", "/repos/external-training-project/cloud_runner.yaml",
         "--local-output-dir", "/pipeline/artifacts/job-123",
-        "--dataset", "gs://bucket/datasets/v1",
         "--env", "EPOCHS=5",
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.STDOUT,
@@ -257,4 +255,8 @@ By default, the uploaded source tarball is kept on failure for debugging. Use `-
 
 ## Notes
 
-Cloud Run L4 GPU jobs require at least 4 CPU and 16Gi memory. This implementation enforces `gpu: 1` and `gpu_type: nvidia-l4`. The task timeout default is 3600 seconds; for longer training, split work into resumable jobs or adapt the same source-bundle pattern to a longer-running GPU platform.
+Cloud Run L4 GPU jobs require at least 4 CPU and 16Gi memory. This implementation enforces `gpu: 1` and `gpu_type: nvidia-l4`. 
+The task timeout default is 3600 seconds; for longer training, split work into resumable jobs or adapt the same source-bundle pattern 
+to a longer-running GPU platform.
+
+Since runners are designed for exploratory research and architectures tests, 1h runtime is sufficient for such tasks.
