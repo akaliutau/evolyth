@@ -51,7 +51,7 @@ Evolyth is a compact implementation of that idea. It is designed for model archi
 
 ## The technical story
 
-Evolyth treats AI-assisted research as an **orchestrated experiment graph**, not a chat session.
+Evolyth treats AI-assisted research as an **orchestrated evolution graph/tree**, not a chat session.
 
 A human writes a Research Problem (RP): the goal, the training/evaluation script, and the mutable model file. Evolyth then creates isolated workspaces for each run, asks a mutation worker to make one bounded change, executes the result, extracts metrics, asks a reviewer to interpret what happened, stores the full artifact trail, and uses that evidence to choose the next step.
 
