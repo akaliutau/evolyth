@@ -3,6 +3,8 @@ from __future__ import annotations
 import abc
 import asyncio
 import json
+import os
+import shlex
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -57,40 +59,59 @@ class ClaudeCodeAgent(MutationAgent):
     def __init__(
         self,
         executable: str = "claude",
-        permission_mode: str = "auto",
+        permission_mode: str = "acceptEdits",
         max_turns: int = 8,
         timeout_s: int | None = None,
+        allowed_tools: list[str] | None = None,
     ):
         self.executable = executable
         self.permission_mode = permission_mode
         self.max_turns = max_turns
-        self.timeout_s = timeout_s
+        self.timeout_s = timeout_s if timeout_s is not None else _env_int("EVOLVER_CLAUDE_TIMEOUT_S", 900)
+        # Keep mutation deterministic and non-interactive. The executor, not the
+        # mutation worker, is responsible for running train_eval.py afterwards.
+        self.allowed_tools = allowed_tools or ["Read", "Edit"]
 
     async def mutate(self, rp: ResearchProblem, context: str) -> MutationResult:
         prompt = _claude_mutation_prompt(rp, context)
-        cmd = [
-            self.executable,
-            "--bare",
-            "-p",
-            prompt,
-            "--output-format",
-            "json",
-            "--permission-mode",
-            self.permission_mode,
-            "--allowedTools",
-            "Read,Edit,Bash",
-            "--max-turns",
-            str(self.max_turns),
-        ]
-        print("running agent:")
-        print(cmd)
+        cmd = _claude_print_command(
+            executable=self.executable,
+            prompt=prompt,
+            permission_mode=self.permission_mode,
+            allowed_tools=self.allowed_tools,
+            max_turns=self.max_turns,
+        )
+        print(f"[evolver] Claude Code mutation start cwd={rp.path} timeout_s={self.timeout_s}", flush=True)
         stdout, stderr, code = await _run_text_command(cmd, cwd=rp.path, timeout_s=self.timeout_s)
+        print(f"[evolver] Claude Code mutation finished exit_code={code}", flush=True)
         if code != 0:
-            raise RuntimeError(f"Claude Code mutation failed with exit code {code}: {stderr[-2000:]}")
+            raise RuntimeError(_command_error("Claude Code mutation", cmd, code, stdout, stderr))
         data = _parse_jsonish(stdout)
+        if data.get("is_error") is True:
+            raise RuntimeError(_command_error("Claude Code mutation", cmd, code, stdout, stderr))
         if isinstance(data.get("result"), str):
             data = _parse_jsonish(data["result"])
         data.setdefault("raw_output", stdout)
+        return MutationResult.from_dict(data)
+
+
+class ExternalCommandAgent(MutationAgent):
+    """Adapter for a mutation script that reads JSON on stdin and returns JSON."""
+
+    def __init__(self, command: str | list[str], timeout_s: int | None = None):
+        self.command = shlex.split(command) if isinstance(command, str) else list(command)
+        self.timeout_s = timeout_s
+
+    async def mutate(self, rp: ResearchProblem, context: str) -> MutationResult:
+        payload = {
+            "rp_path": str(rp.path),
+            "mutable_file": rp.mutable_file,
+            "context": context,
+            "current_model": rp.model_path.read_text(encoding="utf-8"),
+        }
+        data = await _run_json_command(self.command, payload, cwd=rp.path, timeout_s=self.timeout_s)
+        if isinstance(data.get("model_py"), str):
+            rp.model_path.write_text(data["model_py"], encoding="utf-8")
         return MutationResult.from_dict(data)
 
 
@@ -99,7 +120,48 @@ def make_agent(kind: str, *, command: str | None = None, timeout_s: int | None =
         return NoopAgent()
     if kind == "claude-code":
         return ClaudeCodeAgent(timeout_s=timeout_s)
+    if kind == "external-command":
+        if not command:
+            raise ValueError("external-command agent requires --agent-command")
+        return ExternalCommandAgent(command, timeout_s=timeout_s)
     raise ValueError(f"Unknown agent kind: {kind}")
+
+
+def _env_int(name: str, default: int) -> int:
+    raw = os.environ.get(name)
+    if raw is None or raw.strip() == "":
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        return default
+
+
+def _claude_print_command(
+    *,
+    executable: str,
+    prompt: str,
+    permission_mode: str,
+    allowed_tools: list[str],
+    max_turns: int,
+) -> list[str]:
+    # Claude Code expects tool patterns as separate arguments, e.g.
+    # --allowedTools Read Edit Bash(git status). Do not pass "Read,Edit,Bash"
+    # as a single synthetic tool name.
+    return [
+        executable,
+        "--bare",
+        "-p",
+        prompt,
+        "--output-format",
+        "json",
+        "--permission-mode",
+        permission_mode,
+        "--allowedTools",
+        *allowed_tools,
+        "--max-turns",
+        str(max_turns),
+    ]
 
 
 def _claude_mutation_prompt(rp: ResearchProblem, context: str) -> str:
@@ -114,7 +176,7 @@ Hard rules:
 - Keep the implementation simple, reliable, and easy to modify.
 - Do not add dependencies unless the RP already allows them.
 - Do not use pretrained weights or external data.
-- Run the dry-run command if it is cheap and available.
+- Do not run training or dry-run commands; the evolver executor runs them after mutation.
 
 After editing, return ONLY valid JSON with this shape:
 {{
@@ -135,6 +197,7 @@ async def _run_json_command(command: list[str], payload: dict[str, Any], *, cwd:
         stdin=asyncio.subprocess.PIPE,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
+        env=os.environ.copy(),
     )
     try:
         stdout, stderr = await asyncio.wait_for(
@@ -145,9 +208,11 @@ async def _run_json_command(command: list[str], payload: dict[str, Any], *, cwd:
         proc.kill()
         await proc.wait()
         raise TimeoutError(f"Command timed out after {timeout_s}s: {command}")
+    stdout_text = stdout.decode("utf-8", errors="replace")
+    stderr_text = stderr.decode("utf-8", errors="replace")
     if proc.returncode != 0:
-        raise RuntimeError(stderr.decode("utf-8", errors="replace"))
-    return _parse_jsonish(stdout.decode("utf-8", errors="replace"))
+        raise RuntimeError(_command_error("external mutation command", command, int(proc.returncode or 0), stdout_text, stderr_text))
+    return _parse_jsonish(stdout_text)
 
 
 async def _run_text_command(command: list[str], *, cwd: Path, timeout_s: int | None) -> tuple[str, str, int]:
@@ -156,6 +221,7 @@ async def _run_text_command(command: list[str], *, cwd: Path, timeout_s: int | N
         cwd=str(cwd),
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
+        env=os.environ.copy(),
     )
     try:
         stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout_s)
@@ -186,3 +252,17 @@ def _parse_jsonish(text: str) -> dict[str, Any]:
         parsed = json.loads(text[start : end + 1])
         return parsed if isinstance(parsed, dict) else {"result": parsed}
     raise ValueError(f"Could not parse JSON output: {text[:1000]}")
+
+
+def _command_error(name: str, command: list[str], code: int, stdout: str, stderr: str) -> str:
+    def tail(text: str, limit: int = 2000) -> str:
+        text = text.strip()
+        return text[-limit:] if text else "<empty>"
+
+    safe_cmd = ["<prompt>" if i > 0 and command[i - 1] in {"-p", "--print"} else part for i, part in enumerate(command)]
+    return (
+        f"{name} failed with exit code {code}\n"
+        f"command: {shlex.join(safe_cmd)}\n"
+        f"stdout tail:\n{tail(stdout)}\n"
+        f"stderr tail:\n{tail(stderr)}"
+    )

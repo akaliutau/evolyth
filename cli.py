@@ -8,7 +8,8 @@ from typing import Any
 
 from core.agent import make_agent
 from core.context_builder import build_context_packet
-from core.executor import LocalExecutor, RunSpec
+from core.env import default_dotenv_paths, load_dotenv_files
+from core.executor import CloudRunExecutor, Executor, LocalExecutor, RunSpec
 from core.ids import next_run_id
 from core.orchestrator import EvolutionConfig, EvolutionOrchestrator
 from core.queue import MutationQueue
@@ -21,6 +22,9 @@ from core.store import EvolutionStore
 def main() -> None:
     p = argparse.ArgumentParser(description="Minimal stable self-evolution runner")
     p.add_argument("--arena", default=".arena", help="arena state folder")
+    p.add_argument("--env-file", action="append", help="load an additional .env file before running subcommands")
+    p.add_argument("--no-auto-env", action="store_true", help="do not auto-load .env from repo/cwd/RP folders")
+    p.add_argument("--override-env", action="store_true", help="let .env values override existing process environment variables")
     sub = p.add_subparsers(dest="cmd", required=True)
 
     init = sub.add_parser("init", help="validate RP and initialize arena")
@@ -36,6 +40,7 @@ def main() -> None:
     run.add_argument("--mutation-type", default="baseline")
     run.add_argument("--mutation-summary", default="")
     run.add_argument("--hypothesis", default="")
+    _add_executor_args(run)
     run.add_argument("extra_args", nargs="*")
 
     evolve = sub.add_parser("evolve", help="run autonomous select→mutate→execute→review→queue loop")
@@ -49,6 +54,7 @@ def main() -> None:
     evolve.add_argument("--timeout-s", type=int)
     evolve.add_argument("--no-queue", action="store_true", help="select parents directly instead of consuming/enqueuing queue items")
     evolve.add_argument("--no-validate-single-file", action="store_true", help="allow edits beyond the RP mutable file")
+    _add_executor_args(evolve)
     evolve.add_argument("extra_args", nargs="*")
 
     q = sub.add_parser("queue", help="list queued mutation ideas")
@@ -74,6 +80,7 @@ def main() -> None:
 
     args = p.parse_args()
     arena = Path(args.arena).expanduser().resolve()
+    _load_cli_env(args)
 
     if args.cmd == "init":
         rp = ResearchProblem.load(args.rp)
@@ -100,10 +107,31 @@ def main() -> None:
         uvicorn.run(create_app(arena), host=args.host, port=args.port)
 
 
+def _load_cli_env(args: argparse.Namespace) -> None:
+    rp_path = getattr(args, "rp", None)
+    candidates: list[Path] = []
+    if not getattr(args, "no_auto_env", False):
+        candidates.extend(default_dotenv_paths(cli_file=__file__, cwd=Path.cwd(), rp_path=rp_path))
+    for env_file in getattr(args, "env_file", None) or []:
+        candidates.append(Path(env_file))
+    load_dotenv_files(candidates, override=bool(getattr(args, "override_env", False)))
+
+
+
+def _add_executor_args(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--executor", choices=["local", "cloud-run"], default="local", help="where to execute the RP command")
+    parser.add_argument("--cloud-runner-script", default="gcp_cloud_runner/application_cloud_runner.py", help="path to application_cloud_runner.py")
+    parser.add_argument("--cloud-spec", help="path to cloud_runner.yaml; defaults to <rp>/cloud_runner.yaml")
+    parser.add_argument("--cloud-dataset", help="optional gs:// dataset override for Cloud Run")
+    parser.add_argument("--cloud-env", action="append", default=[], help="Cloud Run execution env override; repeat KEY=VALUE")
+    parser.add_argument("--cloud-poll-interval-s", type=int, default=15)
+    parser.add_argument("--cloud-log-format", choices=["text", "json"], default="text")
+
+
 async def _run(args: argparse.Namespace, arena: Path) -> None:
     rp = ResearchProblem.load(args.rp)
     run_id = args.run_id or next_run_id(arena)
-    executor = LocalExecutor(RunArtifacts(arena), timeout_s=args.timeout_s)
+    executor = _make_executor(args, arena)
     record = await executor.execute(
         RunSpec(
             rp=rp,
@@ -138,9 +166,46 @@ async def _evolve(args: argparse.Namespace, arena: Path) -> None:
         ),
         agent=agent,
         reviewer=reviewer,
+        executor=_make_executor(args, arena),
     )
     results = await orchestrator.evolve_many()
     print(json.dumps([r.__dict__ for r in results], indent=2, sort_keys=True, default=str))
+
+
+def _make_executor(args: argparse.Namespace, arena: Path) -> Executor:
+    artifacts = RunArtifacts(arena)
+    if args.executor == "local":
+        return LocalExecutor(artifacts, timeout_s=args.timeout_s)
+    return CloudRunExecutor(
+        artifacts,
+        cloud_runner_script=_resolve_repo_path(args.cloud_runner_script),
+        cloud_spec=Path(args.cloud_spec).expanduser().resolve() if args.cloud_spec else None,
+        timeout_s=args.timeout_s,
+        dataset=args.cloud_dataset,
+        env=_parse_key_value(args.cloud_env),
+        poll_interval_s=args.cloud_poll_interval_s,
+        log_format=args.cloud_log_format,
+    )
+
+
+def _resolve_repo_path(value: str) -> Path:
+    path = Path(value).expanduser()
+    if path.is_absolute():
+        return path
+    return (Path.cwd() / path).resolve()
+
+
+def _parse_key_value(items: list[str]) -> dict[str, str]:
+    env: dict[str, str] = {}
+    for item in items:
+        if "=" not in item:
+            raise SystemExit(f"Expected KEY=VALUE, got: {item!r}")
+        key, value = item.split("=", 1)
+        key = key.strip()
+        if not key:
+            raise SystemExit(f"Invalid empty environment variable name in: {item!r}")
+        env[key] = value
+    return env
 
 
 def _print_rows(rows: list[dict[str, Any]]) -> None:

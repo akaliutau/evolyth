@@ -649,6 +649,8 @@ def main() -> int:
     parser.add_argument("--env", action="append", default=[], help="Run-specific environment override passed to the Cloud Run execution; repeat KEY=VALUE")
     parser.add_argument("--env-file", action="append", default=[], help="File with KEY=VALUE lines to pass as run-specific env overrides")
     parser.add_argument("--dataset", default=None, help="Optional gs:// dataset URI overriding spec.dataset.uri")
+    parser.add_argument("--run-id", default=None, help="Optional external run id. Defaults to a timestamp/uuid id.")
+    parser.add_argument("--command-arg", action="append", default=[], help="Append one argument to runtime.command; repeat for multiple args")
     parser.add_argument("--local-output-dir", default=None, help="Where to sync artifacts after the job finishes")
     parser.add_argument("--timeout-seconds", type=int, default=None, help="Local orchestration timeout; defaults to cloud_run.task_timeout + 15 minutes")
     parser.add_argument("--poll-interval-seconds", type=int, default=15, help="Execution polling interval")
@@ -680,7 +682,9 @@ def main() -> int:
     repo = str(spec.get("artifact_repo") or os.environ.get("AR_REPO") or "application-cloud-runner")
     service_account = str(spec.get("service_account") or os.environ.get("SA_EMAIL") or f"acr-runner@{project_id}.iam.gserviceaccount.com")
     name = safe_name(str(spec.get("name") or app_dir.name), max_len=36)
-    run_id = f"{datetime.now(timezone.utc).strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:8]}"
+    run_id = args.run_id.strip() if args.run_id else f"{datetime.now(timezone.utc).strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:8]}"
+    if not re.match(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$", run_id):
+        raise RunnerError("run-id must be 1-128 chars and contain only letters, digits, dot, underscore, or dash", 64)
     job_name = safe_name(f"{name}-{run_id}", max_len=63)
     runner_image = resolve_runner_image(spec, project_id, region, repo, default_name=name)
     source_prefix = str((spec.get("source") or {}).get("gcs_prefix") or f"gs://{bucket}/acr-sources/{name}").rstrip("/")
@@ -689,10 +693,9 @@ def main() -> int:
     output_gcs_uri = f"{output_prefix}/{run_id}"
     local_output_dir = pathlib.Path(args.local_output_dir or ((spec.get("artifacts") or {}).get("local_dir") or f"./artifacts/{run_id}")).resolve()
 
-    command = resolve_command(spec)
+    command = [*resolve_command(spec), *args.command_arg]
     cloud = validate_cloud_run_shape(spec)
     dataset = resolve_dataset(spec, args.dataset)
-    print(dataset)
     task_timeout_seconds = timeout_to_seconds(cloud["task_timeout"])
     orchestration_timeout = args.timeout_seconds or (task_timeout_seconds + 900)
     if args.poll_interval_seconds < 2:
@@ -745,6 +748,7 @@ def main() -> int:
         "image_uri": runner_image,
         "source_gcs_uri": source_gcs_uri,
         "dataset": dataset,
+        "command": command,
         "output_gcs_uri": output_gcs_uri,
         "local_output_dir": str(local_output_dir),
         "status": "initializing",
@@ -840,3 +844,5 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
         emit("runner_interrupted")
         raise SystemExit(130)
+
+

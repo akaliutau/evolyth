@@ -161,15 +161,9 @@ python gcp_cloud_runner/application_cloud_runner.py   \
   --app-dir /media/DATA/repos-work/tiny-cifar   \
   --spec  /media/DATA/repos-work/tiny-cifar/cloud_runner.yaml   \
   --local-output-dir ./artifacts/run-001   \
-  --run-id run_000001   \
-  --command-arg=--epochs   \
-  --command-arg=3   \
+  --env EPOCHS=3   \
   --env LR=0.0003
 ```
-
-`--run-id` is optional for standalone use but should be supplied by parent systems
-that need stable local/cloud artifact paths. `--command-arg` appends arguments to
-`runtime.command`; use the `--command-arg=value` form for values beginning with `--`.
 
 What happens:
 
@@ -266,5 +260,3 @@ The task timeout default is 3600 seconds; for longer training, split work into r
 to a longer-running GPU platform.
 
 Since runners are designed for exploratory research and architectures tests, 1h runtime is sufficient for such tasks.
-
-

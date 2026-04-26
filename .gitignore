@@ -210,5 +210,6 @@ aggregated_dump.txt
 *-key.json
 .arena
 .idea
+*.txt
 artifacts/**
 **/artifacts

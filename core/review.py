@@ -3,6 +3,7 @@ from __future__ import annotations
 import abc
 import asyncio
 import json
+import os
 import shlex
 from pathlib import Path
 from typing import Any
@@ -49,32 +50,65 @@ class ClaudeCodeReviewer(Reviewer):
     def __init__(self, executable: str = "claude", max_turns: int = 4, timeout_s: int | None = None):
         self.executable = executable
         self.max_turns = max_turns
-        self.timeout_s = timeout_s
+        self.timeout_s = timeout_s if timeout_s is not None else _env_int("EVOLVER_CLAUDE_REVIEW_TIMEOUT_S", 300)
 
     async def review(self, parent: dict[str, Any] | None, child: dict[str, Any], context: str) -> dict[str, Any]:
         prompt = _review_prompt(parent, child, context)
-        cmd = [
-            self.executable,
-            "--bare",
-            "-p",
-            prompt,
-            "--output-format",
-            "json",
-            "--permission-mode",
-            "auto",
-            "--allowedTools",
-            "Read",
-            "--max-turns",
-            str(self.max_turns),
-        ]
-        stdout, stderr, code = await _run_text_command(cmd, cwd=Path(child.get("artifact_path") or "."), timeout_s=self.timeout_s)
+        cmd = _claude_print_command(
+            executable=self.executable,
+            prompt=prompt,
+            permission_mode="default",
+            allowed_tools=["Read"],
+            max_turns=self.max_turns,
+        )
+        cwd = Path(child.get("artifact_path") or ".")
+        print(f"[evolver] Claude Code review start cwd={cwd} timeout_s={self.timeout_s}", flush=True)
+        stdout, stderr, code = await _run_text_command(cmd, cwd=cwd, timeout_s=self.timeout_s)
+        print(f"[evolver] Claude Code review finished exit_code={code}", flush=True)
         if code != 0:
-            raise RuntimeError(f"Claude Code review failed with exit code {code}: {stderr[-2000:]}")
+            raise RuntimeError(_command_error("Claude Code review", cmd, code, stdout, stderr))
         data = _parse_jsonish(stdout)
+        if data.get("is_error") is True:
+            raise RuntimeError(_command_error("Claude Code review", cmd, code, stdout, stderr))
         if isinstance(data.get("result"), str):
             data = _parse_jsonish(data["result"])
         return data
 
+
+
+
+def _env_int(name: str, default: int) -> int:
+    raw = os.environ.get(name)
+    if raw is None or raw.strip() == "":
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        return default
+
+
+def _claude_print_command(
+    *,
+    executable: str,
+    prompt: str,
+    permission_mode: str,
+    allowed_tools: list[str],
+    max_turns: int,
+) -> list[str]:
+    return [
+        executable,
+        "--bare",
+        "-p",
+        prompt,
+        "--output-format",
+        "json",
+        "--permission-mode",
+        permission_mode,
+        "--allowedTools",
+        *allowed_tools,
+        "--max-turns",
+        str(max_turns),
+    ]
 
 def make_reviewer(kind: str, *, command: str | None = None, timeout_s: int | None = None) -> Reviewer:
     if kind == "heuristic":
@@ -198,6 +232,7 @@ async def _run_json_command(command: list[str], payload: dict[str, Any], *, cwd:
         stdin=asyncio.subprocess.PIPE,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
+        env=os.environ.copy(),
     )
     try:
         stdout, stderr = await asyncio.wait_for(proc.communicate(json.dumps(payload).encode("utf-8")), timeout=timeout_s)
@@ -205,9 +240,11 @@ async def _run_json_command(command: list[str], payload: dict[str, Any], *, cwd:
         proc.kill()
         await proc.wait()
         raise TimeoutError(f"Reviewer command timed out after {timeout_s}s: {command}")
+    stdout_text = stdout.decode("utf-8", errors="replace")
+    stderr_text = stderr.decode("utf-8", errors="replace")
     if proc.returncode != 0:
-        raise RuntimeError(stderr.decode("utf-8", errors="replace"))
-    return _parse_jsonish(stdout.decode("utf-8", errors="replace"))
+        raise RuntimeError(_command_error("external review command", command, int(proc.returncode or 0), stdout_text, stderr_text))
+    return _parse_jsonish(stdout_text)
 
 
 async def _run_text_command(command: list[str], *, cwd: Path, timeout_s: int | None) -> tuple[str, str, int]:
@@ -216,6 +253,7 @@ async def _run_text_command(command: list[str], *, cwd: Path, timeout_s: int | N
         cwd=str(cwd),
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
+        env=os.environ.copy(),
     )
     try:
         stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout_s)
@@ -245,3 +283,19 @@ def _parse_jsonish(text: str) -> dict[str, Any]:
         parsed = json.loads(text[start : end + 1])
         return parsed if isinstance(parsed, dict) else {"result": parsed}
     raise ValueError(f"Could not parse JSON output: {text[:1000]}")
+
+
+
+
+def _command_error(name: str, command: list[str], code: int, stdout: str, stderr: str) -> str:
+    def tail(text: str, limit: int = 2000) -> str:
+        text = text.strip()
+        return text[-limit:] if text else "<empty>"
+
+    safe_cmd = ["<prompt>" if i > 0 and command[i - 1] in {"-p", "--print"} else part for i, part in enumerate(command)]
+    return (
+        f"{name} failed with exit code {code}\n"
+        f"command: {shlex.join(safe_cmd)}\n"
+        f"stdout tail:\n{tail(stdout)}\n"
+        f"stderr tail:\n{tail(stderr)}"
+    )

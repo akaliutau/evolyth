@@ -16,13 +16,20 @@ def read_metrics(path: Path) -> dict[str, Any]:
             "score": -999.0,
         }
     try:
-        return json.loads(path.read_text(encoding="utf-8"))
-    except Exception as e:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception as exc:
         return {
             "status": "failed",
-            "error_type": f"bad_metrics_json:{type(e).__name__}",
+            "error_type": f"bad_metrics_json:{type(exc).__name__}",
             "score": -999.0,
         }
+    if not isinstance(data, dict):
+        return {
+            "status": "failed",
+            "error_type": "metrics_json_not_object",
+            "score": -999.0,
+        }
+    return data
 
 
 def extract_record(
@@ -35,8 +42,9 @@ def extract_record(
     mutation_type: str,
     mutation_summary: str,
     hypothesis: str,
+    metrics_path: str | Path | None = None,
 ) -> RunRecord:
-    metrics = read_metrics(rp.metrics_path(run_id))
+    metrics = read_metrics(Path(metrics_path) if metrics_path else rp.metrics_path(run_id))
     return RunRecord.from_metrics(
         run_id=run_id,
         rp_id=rp.rp_id,

@@ -144,6 +144,42 @@ python cli.py --arena .arena evolve \
   -- --epochs 2 --max-steps 200
 ```
 
+## Cloud Run execution
+
+Use the same `run` and `evolve` commands with `--executor cloud-run`. The executor calls
+`gcp_cloud_runner/application_cloud_runner.py`, passes the evolver run id through to
+Cloud Run, appends RP args after `--` to the YAML `runtime.command`, and syncs outputs
+back into the same canonical artifact directory used locally:
+
+```text
+.arena/runs/<run_id>/
+  model.py
+  goal_prompt.md
+  metrics.json
+  events.jsonl
+  run_summary.md
+  stdout.txt
+  stderr.txt
+  manifest.json
+  _acr/...              # Cloud Runner metadata/logs when using --executor cloud-run
+```
+
+The RP should write outputs under `$ACR_ARTIFACT_DIR`. `train_eval.py` already does this,
+and also reads `DATASET_DIR` when the Cloud Runner downloads a configured dataset.
+
+```bash
+python cli.py --arena .arena evolve \
+  --rp /path/to/tiny-cifar \
+  --steps 5 \
+  --agent claude-code \
+  --reviewer heuristic \
+  --executor cloud-run \
+  --cloud-spec /path/to/tiny-cifar/cloud_runner.yaml \
+  -- --dataset cifar10 --epochs 2 --max-steps 200
+```
+
+If `--cloud-spec` is omitted, the executor uses `<rp>/cloud_runner.yaml`.
+
 ## External LLM integration contract
 
 For mutation, implement any command that reads JSON on stdin:
