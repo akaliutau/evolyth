@@ -1,0 +1,1029 @@
+from __future__ import annotations
+
+"""Read-only live demo UI for Stable Evolver arenas.
+
+Drop this file into the repository as `core/ui_demo.py` and run either:
+
+    python -m core.ui_demo --arena .arena --port 8080
+
+or wire it into cli.py with the accompanying patch.
+
+The dashboard intentionally avoids the FastAPI layer and reads `.arena` directly:
+- `.arena/evolution.jsonl`
+- `.arena/queue.json`
+- `.arena/runs/<run_id>/manifest.json`
+- `.arena/runs/<run_id>/metrics.json`
+- `.arena/runs/<run_id>/events.jsonl`
+- `.arena/runs/<run_id>/ds_review.json`
+- `.arena/runs/<run_id>/mutation.json`
+
+It is read-only: no POST/PUT actions, no mutation triggers, no background workers.
+"""
+
+import argparse
+import html
+import json
+import math
+import re
+import time
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any, Iterable
+
+
+# -----------------------------------------------------------------------------
+# Small filesystem event bus
+# -----------------------------------------------------------------------------
+
+
+@dataclass
+class RunView:
+    data: dict[str, Any]
+    review: dict[str, Any] = field(default_factory=dict)
+    mutation: dict[str, Any] = field(default_factory=dict)
+    metrics: dict[str, Any] = field(default_factory=dict)
+    events: list[dict[str, Any]] = field(default_factory=list)
+
+    @property
+    def run_id(self) -> str:
+        return str(self.data.get("run_id") or "")
+
+    @property
+    def parent_id(self) -> str | None:
+        value = self.data.get("parent_id")
+        return str(value) if value not in (None, "", "None") else None
+
+    @property
+    def generation(self) -> int:
+        return _int(self.data.get("generation"), 0)
+
+    @property
+    def score(self) -> float:
+        return _float(self.data.get("score"), -999.0)
+
+    @property
+    def status(self) -> str:
+        return str(self.data.get("status") or "unknown")
+
+
+@dataclass
+class ArenaSnapshot:
+    arena: Path
+    generated_at: float
+    revision: int
+    runs: list[RunView]
+    queue: list[dict[str, Any]]
+    audit_events: list[dict[str, Any]]
+    touched_paths: list[str]
+
+    @property
+    def runs_by_id(self) -> dict[str, RunView]:
+        return {r.run_id: r for r in self.runs if r.run_id}
+
+    @property
+    def latest_run(self) -> RunView | None:
+        if not self.runs:
+            return None
+        return max(self.runs, key=lambda r: (_timestamp_key(r.data), _run_num(r.run_id)))
+
+    @property
+    def best_run(self) -> RunView | None:
+        succeeded = [r for r in self.runs if r.status == "succeeded"]
+        rows = succeeded or self.runs
+        return max(rows, key=lambda r: r.score) if rows else None
+
+
+class FileEventBus:
+    """Tiny polling bus: turns arena file changes into immutable snapshots."""
+
+    def __init__(self, arena: str | Path):
+        self.arena = Path(arena).expanduser().resolve()
+        self._fingerprint: tuple[tuple[str, int, int], ...] = ()
+        self._snapshot = ArenaSnapshot(self.arena, time.time(), 0, [], [], [], [])
+        self._revision = 0
+
+    @property
+    def snapshot(self) -> ArenaSnapshot:
+        return self._snapshot
+
+    def poll(self, *, force: bool = False) -> tuple[ArenaSnapshot, bool]:
+        fingerprint = self._scan_fingerprint()
+        if not force and fingerprint == self._fingerprint:
+            return self._snapshot, False
+        self._fingerprint = fingerprint
+        self._revision += 1
+        self._snapshot = ArenaReader(self.arena).read(revision=self._revision)
+        return self._snapshot, True
+
+    def _scan_fingerprint(self) -> tuple[tuple[str, int, int], ...]:
+        paths: list[Path] = []
+        for rel in ["queue.json", "evolution.jsonl"]:
+            p = self.arena / rel
+            if p.exists():
+                paths.append(p)
+        runs_dir = self.arena / "runs"
+        if runs_dir.exists():
+            for name in ["manifest.json", "metrics.json", "events.jsonl", "ds_review.json", "mutation.json", "stdout.txt", "stderr.txt"]:
+                paths.extend(runs_dir.glob(f"*/{name}"))
+        fp: list[tuple[str, int, int]] = []
+        for p in sorted(set(paths)):
+            try:
+                st = p.stat()
+            except FileNotFoundError:
+                continue
+            fp.append((str(p.relative_to(self.arena)), st.st_mtime_ns, st.st_size))
+        return tuple(fp)
+
+
+class ArenaReader:
+    def __init__(self, arena: str | Path):
+        self.arena = Path(arena).expanduser().resolve()
+
+    def read(self, *, revision: int) -> ArenaSnapshot:
+        self.arena.mkdir(parents=True, exist_ok=True)
+        audit_events = _read_jsonl(self.arena / "evolution.jsonl")[-250:]
+        queue = _as_list(_read_json(self.arena / "queue.json", []))
+        runs = self._read_runs(audit_events)
+        touched = [str(p.relative_to(self.arena)) for p in self._interesting_paths()]
+        return ArenaSnapshot(
+            arena=self.arena,
+            generated_at=time.time(),
+            revision=revision,
+            runs=runs,
+            queue=sorted(queue, key=lambda r: _float(r.get("priority"), 0.0), reverse=True),
+            audit_events=audit_events,
+            touched_paths=touched,
+        )
+
+    def _read_runs(self, audit_events: list[dict[str, Any]]) -> list[RunView]:
+        rows: dict[str, dict[str, Any]] = {}
+
+        # Fall back to the audit log if LanceDB is unavailable and/or manifests are incomplete.
+        for event in audit_events:
+            if event.get("event") == "run_registered" and event.get("run_id"):
+                rows[str(event["run_id"])] = {k: v for k, v in event.items() if k != "event"}
+
+        runs_dir = self.arena / "runs"
+        if runs_dir.exists():
+            for run_dir in sorted(p for p in runs_dir.iterdir() if p.is_dir()):
+                run_id = run_dir.name
+                manifest = _as_dict(_read_json(run_dir / "manifest.json", {}))
+                metrics = _as_dict(_read_json(run_dir / "metrics.json", {}))
+                mutation = _as_dict(_read_json(run_dir / "mutation.json", {}))
+                review = _as_dict(_read_json(run_dir / "ds_review.json", {}))
+
+                row = dict(rows.get(run_id, {}))
+                row.update({k: v for k, v in manifest.items() if k != "vector"})
+                row.setdefault("run_id", run_id)
+                row.setdefault("artifact_path", str(run_dir))
+                row.setdefault("metrics_path", str(run_dir / "metrics.json"))
+                row.setdefault("events_path", str(run_dir / "events.jsonl"))
+                row.setdefault("model_path", str(run_dir / "model.py"))
+                row.setdefault("summary_path", str(run_dir / "run_summary.md"))
+
+                # Fill gaps from metrics/mutation/review without hiding manifest values.
+                for key in [
+                    "status",
+                    "score",
+                    "val_accuracy",
+                    "accuracy",
+                    "val_loss",
+                    "parameter_count",
+                    "params",
+                    "model_bytes",
+                    "latency_ms",
+                    "train_seconds",
+                    "dry_run_passed",
+                    "error_type",
+                    "observation",
+                ]:
+                    if row.get(key) in (None, "") and key in metrics:
+                        row[key] = metrics[key]
+                if row.get("val_accuracy") in (None, "") and metrics.get("accuracy") is not None:
+                    row["val_accuracy"] = metrics.get("accuracy")
+                if row.get("parameter_count") in (None, "") and metrics.get("params") is not None:
+                    row["parameter_count"] = metrics.get("params")
+                if row.get("mutation_type") in (None, "") and mutation.get("mutation_type"):
+                    row["mutation_type"] = mutation.get("mutation_type")
+                if row.get("mutation_summary") in (None, "") and mutation.get("mutation_summary"):
+                    row["mutation_summary"] = mutation.get("mutation_summary")
+                if row.get("hypothesis") in (None, "") and mutation.get("hypothesis"):
+                    row["hypothesis"] = mutation.get("hypothesis")
+                if review:
+                    row.setdefault("observation", review.get("observation"))
+                    row.setdefault("next_belief", review.get("next_belief"))
+
+                rows[run_id] = row
+
+        run_views: list[RunView] = []
+        for run_id, row in rows.items():
+            run_dir = Path(str(row.get("artifact_path") or self.arena / "runs" / run_id))
+            review = _as_dict(_read_json(run_dir / "ds_review.json", {}))
+            mutation = _as_dict(_read_json(run_dir / "mutation.json", {}))
+            metrics = _as_dict(_read_json(run_dir / "metrics.json", {}))
+            events = _read_jsonl(run_dir / "events.jsonl")[-80:]
+            run_views.append(RunView(data=row, review=review, mutation=mutation, metrics=metrics, events=events))
+
+        return sorted(run_views, key=lambda r: (_timestamp_key(r.data), _run_num(r.run_id)))
+
+    def _interesting_paths(self) -> Iterable[Path]:
+        for rel in ["queue.json", "evolution.jsonl"]:
+            p = self.arena / rel
+            if p.exists():
+                yield p
+        runs_dir = self.arena / "runs"
+        if not runs_dir.exists():
+            return
+        for name in ["manifest.json", "metrics.json", "events.jsonl", "ds_review.json", "mutation.json"]:
+            yield from runs_dir.glob(f"*/{name}")
+
+
+# -----------------------------------------------------------------------------
+# Derived model for UI
+# -----------------------------------------------------------------------------
+
+
+def leaderboard(runs: list[RunView], limit: int = 8) -> list[RunView]:
+    rows = [r for r in runs if r.status == "succeeded"] or runs
+    return sorted(rows, key=lambda r: r.score, reverse=True)[:limit]
+
+
+def pareto_front(runs: list[RunView]) -> set[str]:
+    ids: set[str] = set()
+    candidate_runs = [r for r in runs if r.status == "succeeded"] or runs
+    for a in candidate_runs:
+        dominated = False
+        for b in candidate_runs:
+            if a.run_id == b.run_id:
+                continue
+            if _dominates(b, a):
+                dominated = True
+                break
+        if not dominated and a.run_id:
+            ids.add(a.run_id)
+    return ids
+
+
+def _dominates(a: RunView, b: RunView) -> bool:
+    max_keys = ["score", "val_accuracy"]
+    min_keys = ["parameter_count", "model_bytes", "latency_ms"]
+    better_or_equal = True
+    strictly_better = False
+
+    for key in max_keys:
+        av = _float(a.data.get(key), -math.inf)
+        bv = _float(b.data.get(key), -math.inf)
+        if av < bv:
+            better_or_equal = False
+        if av > bv:
+            strictly_better = True
+
+    for key in min_keys:
+        av = _float(a.data.get(key), math.inf)
+        bv = _float(b.data.get(key), math.inf)
+        if av > bv:
+            better_or_equal = False
+        if av < bv:
+            strictly_better = True
+
+    return better_or_equal and strictly_better
+
+
+def recent_actions(snapshot: ArenaSnapshot, limit: int = 24) -> list[dict[str, Any]]:
+    actions: list[dict[str, Any]] = []
+
+    for event in snapshot.audit_events[-80:]:
+        if event.get("event") == "run_registered":
+            actions.append(
+                {
+                    "ts": event.get("completed_at") or event.get("created_at"),
+                    "actor": "store",
+                    "title": f"registered {event.get('run_id')}",
+                    "detail": f"score={_fmt(event.get('score'))} status={event.get('status')} mutation={event.get('mutation_type')}",
+                    "run_id": event.get("run_id"),
+                }
+            )
+
+    for run in snapshot.runs:
+        for event in run.events[-12:]:
+            title = str(event.get("event") or event.get("type") or "event")
+            detail_bits = []
+            for key in ["epoch", "loss", "val_accuracy", "score", "phase", "action", "message"]:
+                if key in event:
+                    detail_bits.append(f"{key}={_fmt(event.get(key))}")
+            actions.append(
+                {
+                    "ts": event.get("time") or event.get("timestamp") or run.data.get("completed_at") or run.data.get("created_at"),
+                    "actor": "executor",
+                    "title": f"{run.run_id}: {title}",
+                    "detail": "  ".join(detail_bits) or _short_json(event),
+                    "run_id": run.run_id,
+                }
+            )
+        if run.review:
+            actions.append(
+                {
+                    "ts": run.data.get("completed_at") or run.data.get("created_at"),
+                    "actor": "reviewer",
+                    "title": f"reviewed {run.run_id}: {run.review.get('branch_recommendation', 'decision')}",
+                    "detail": f"confidence={_fmt(run.review.get('confidence'))} improvement={run.review.get('is_improvement')}",
+                    "run_id": run.run_id,
+                }
+            )
+
+    for item in snapshot.queue[:80]:
+        actions.append(
+            {
+                "ts": item.get("created_at"),
+                "actor": "queue",
+                "title": f"{item.get('status', 'queued')} {item.get('item_id', '')}",
+                "detail": f"p={_fmt(item.get('priority'))} from={item.get('source_run_id')} type={item.get('mutation_type')}",
+                "run_id": item.get("source_run_id"),
+            }
+        )
+
+    actions.sort(key=lambda a: (_parse_ts(a.get("ts")), str(a.get("title"))), reverse=True)
+    return actions[:limit]
+
+
+# -----------------------------------------------------------------------------
+# SVG renderers (no chart JS dependency)
+# -----------------------------------------------------------------------------
+
+
+def render_branch_svg(snapshot: ArenaSnapshot, selected_run_id: str | None = None) -> str:
+    runs = snapshot.runs
+    if not runs:
+        return _empty_svg("No branches yet. Start `evolve` and this constellation will light up.")
+
+    pareto = pareto_front(runs)
+    latest = snapshot.latest_run.run_id if snapshot.latest_run else None
+    best = snapshot.best_run.run_id if snapshot.best_run else None
+
+    by_gen: dict[int, list[RunView]] = {}
+    for run in runs:
+        by_gen.setdefault(run.generation, []).append(run)
+    for gen in by_gen:
+        by_gen[gen].sort(key=lambda r: (-r.score, _run_num(r.run_id)))
+
+    x_gap = 190
+    y_gap = 92
+    margin_x = 54
+    margin_y = 50
+    width = max(760, margin_x * 2 + x_gap * max(1, len(by_gen)))
+    max_col = max((len(v) for v in by_gen.values()), default=1)
+    height = max(360, margin_y * 2 + y_gap * max_col)
+
+    coords: dict[str, tuple[float, float]] = {}
+    for gen, rows in by_gen.items():
+        x = margin_x + gen * x_gap
+        base = height / 2 - (len(rows) - 1) * y_gap / 2
+        for i, run in enumerate(rows):
+            coords[run.run_id] = (x, base + i * y_gap)
+
+    parts = [
+        f'<svg viewBox="0 0 {width} {height}" class="evo-svg" role="img" aria-label="Evolution branch graph">',
+        '<defs>',
+        '<radialGradient id="nodeGlow" cx="45%" cy="35%" r="70%"><stop offset="0%" stop-color="#ffffff" stop-opacity="0.95"/><stop offset="45%" stop-color="#8b5cf6" stop-opacity="0.9"/><stop offset="100%" stop-color="#06b6d4" stop-opacity="0.95"/></radialGradient>',
+        '<linearGradient id="edgeGrad" x1="0" x2="1"><stop offset="0%" stop-color="#22d3ee" stop-opacity="0.15"/><stop offset="100%" stop-color="#a78bfa" stop-opacity="0.75"/></linearGradient>',
+        '</defs>',
+        '<rect x="0" y="0" width="100%" height="100%" rx="26" class="svg-bg"/>',
+    ]
+
+    # Generation guide rails
+    for gen in sorted(by_gen):
+        x = margin_x + gen * x_gap
+        parts.append(f'<line x1="{x:.1f}" y1="28" x2="{x:.1f}" y2="{height - 28}" class="gen-line"/>')
+        parts.append(f'<text x="{x:.1f}" y="30" class="gen-label">GEN {gen}</text>')
+
+    # Parent edges
+    for run in runs:
+        if not run.parent_id or run.parent_id not in coords or run.run_id not in coords:
+            continue
+        x1, y1 = coords[run.parent_id]
+        x2, y2 = coords[run.run_id]
+        mid = (x1 + x2) / 2
+        parts.append(
+            f'<path d="M{x1 + 18:.1f},{y1:.1f} C{mid:.1f},{y1:.1f} {mid:.1f},{y2:.1f} {x2 - 18:.1f},{y2:.1f}" class="evo-edge"/>'
+        )
+
+    for run in runs:
+        x, y = coords[run.run_id]
+        classes = ["evo-node"]
+        if run.run_id == latest:
+            classes.append("latest")
+        if run.run_id == selected_run_id:
+            classes.append("selected")
+        if run.run_id in pareto:
+            classes.append("pareto")
+        if run.run_id == best:
+            classes.append("best")
+        if run.status != "succeeded":
+            classes.append("failed" if run.status == "failed" else "unknown")
+
+        title = html.escape(
+            f"{run.run_id}\nstatus={run.status}\nscore={_fmt(run.score)}\nacc={_fmt(run.data.get('val_accuracy'))}\n{run.data.get('mutation_summary') or run.data.get('mutation_type') or ''}"
+        )
+        label = html.escape(_short_run(run.run_id))
+        score = html.escape(_fmt(run.score))
+        parts.extend(
+            [
+                f'<g class="{" ".join(classes)}">',
+                f'<title>{title}</title>',
+                f'<circle cx="{x:.1f}" cy="{y:.1f}" r="24" class="node-halo"/>',
+                f'<circle cx="{x:.1f}" cy="{y:.1f}" r="15" class="node-core"/>',
+                f'<text x="{x:.1f}" y="{y + 36:.1f}" class="node-label">{label}</text>',
+                f'<text x="{x:.1f}" y="{y + 52:.1f}" class="node-score">{score}</text>',
+                '</g>',
+            ]
+        )
+    parts.append('</svg>')
+    return "".join(parts)
+
+
+def render_score_svg(runs: list[RunView]) -> str:
+    rows = [r for r in runs if math.isfinite(r.score) and r.score > -998]
+    if len(rows) < 2:
+        return _empty_svg("Score skyline appears after two scored runs.", height=240)
+    rows = sorted(rows, key=lambda r: (_timestamp_key(r.data), _run_num(r.run_id)))
+    width, height = 900, 240
+    left, right, top, bottom = 42, 24, 22, 38
+    min_s = min(r.score for r in rows)
+    max_s = max(r.score for r in rows)
+    spread = max(max_s - min_s, 1e-9)
+
+    def x_at(i: int) -> float:
+        return left + i * (width - left - right) / max(1, len(rows) - 1)
+
+    def y_at(score: float) -> float:
+        return top + (max_s - score) * (height - top - bottom) / spread
+
+    points = [(x_at(i), y_at(r.score), r) for i, r in enumerate(rows)]
+    d = " ".join(("M" if i == 0 else "L") + f"{x:.1f},{y:.1f}" for i, (x, y, _) in enumerate(points))
+    area = d + f" L{points[-1][0]:.1f},{height - bottom:.1f} L{points[0][0]:.1f},{height - bottom:.1f} Z"
+    parts = [
+        f'<svg viewBox="0 0 {width} {height}" class="score-svg" role="img" aria-label="Score over time">',
+        '<defs><linearGradient id="scoreArea" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#38bdf8" stop-opacity="0.28"/><stop offset="100%" stop-color="#8b5cf6" stop-opacity="0.02"/></linearGradient></defs>',
+        f'<rect x="0" y="0" width="{width}" height="{height}" rx="22" class="svg-bg"/>',
+        f'<path d="{area}" fill="url(#scoreArea)"/>',
+        f'<path d="{d}" class="score-line"/>',
+        f'<text x="{left}" y="18" class="axis-text">best {_fmt(max_s)}</text>',
+        f'<text x="{left}" y="{height - 10}" class="axis-text">low {_fmt(min_s)}</text>',
+    ]
+    for x, y, run in points:
+        cls = "score-point best" if run.score == max_s else "score-point"
+        parts.append(f'<circle cx="{x:.1f}" cy="{y:.1f}" r="4.5" class="{cls}"><title>{html.escape(run.run_id)} score={_fmt(run.score)}</title></circle>')
+    parts.append('</svg>')
+    return "".join(parts)
+
+
+def _empty_svg(message: str, *, height: int = 330) -> str:
+    safe = html.escape(message)
+    return f'''<svg viewBox="0 0 900 {height}" class="evo-svg"><rect x="0" y="0" width="900" height="{height}" rx="28" class="svg-bg"/><text x="450" y="{height / 2:.0f}" text-anchor="middle" class="empty-svg-text">{safe}</text></svg>'''
+
+
+# -----------------------------------------------------------------------------
+# NiceGUI application
+# -----------------------------------------------------------------------------
+
+
+DASHBOARD_CSS = r"""
+:root {
+  --bg0: #020617;
+  --bg1: #0f172a;
+  --panel: rgba(15, 23, 42, 0.76);
+  --panel2: rgba(15, 23, 42, 0.52);
+  --line: rgba(148, 163, 184, 0.18);
+  --text: #e2e8f0;
+  --muted: #94a3b8;
+  --cyan: #22d3ee;
+  --violet: #a78bfa;
+  --green: #34d399;
+  --red: #fb7185;
+  --amber: #fbbf24;
+}
+body.body--dark, body {
+  background:
+    radial-gradient(circle at 10% 5%, rgba(34, 211, 238, .18), transparent 31rem),
+    radial-gradient(circle at 80% 8%, rgba(167, 139, 250, .22), transparent 35rem),
+    radial-gradient(circle at 35% 95%, rgba(52, 211, 153, .10), transparent 28rem),
+    var(--bg0) !important;
+  color: var(--text);
+}
+.evo-page { min-height: 100vh; color: var(--text); }
+.glass {
+  background: linear-gradient(135deg, rgba(15,23,42,.84), rgba(15,23,42,.52));
+  border: 1px solid var(--line);
+  box-shadow: 0 24px 80px rgba(0,0,0,.32), inset 0 1px 0 rgba(255,255,255,.05);
+  backdrop-filter: blur(18px);
+}
+.stat-card {
+  min-height: 118px;
+  border-radius: 24px;
+  padding: 18px;
+  background: linear-gradient(135deg, rgba(15, 23, 42, .86), rgba(30, 41, 59, .54));
+  border: 1px solid rgba(148,163,184,.16);
+}
+.stat-value { font-size: 2.15rem; line-height: 1; font-weight: 800; letter-spacing: -.04em; }
+.stat-label { font-size: .76rem; text-transform: uppercase; letter-spacing: .18em; color: var(--muted); }
+.neon { color: #cffafe; text-shadow: 0 0 24px rgba(34,211,238,.52); }
+.tiny { color: var(--muted); font-size: .78rem; }
+.mono { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; }
+.pill {
+  display: inline-flex; align-items: center; gap: 6px; padding: 4px 10px; border-radius: 999px;
+  border: 1px solid rgba(148,163,184,.18); color: #cbd5e1; background: rgba(15,23,42,.52);
+  font-size: .75rem; white-space: nowrap;
+}
+.pill.good { border-color: rgba(52,211,153,.36); color: #bbf7d0; }
+.pill.warn { border-color: rgba(251,191,36,.38); color: #fde68a; }
+.pill.bad { border-color: rgba(251,113,133,.38); color: #fecdd3; }
+.evo-svg, .score-svg { width: 100%; height: auto; display: block; }
+.svg-bg { fill: rgba(2,6,23,.38); stroke: rgba(148,163,184,.14); }
+.gen-line { stroke: rgba(148,163,184,.10); stroke-dasharray: 3 8; }
+.gen-label, .axis-text { fill: rgba(203,213,225,.62); font-size: 12px; font-family: ui-monospace, SFMono-Regular, monospace; }
+.evo-edge { fill: none; stroke: url(#edgeGrad); stroke-width: 2.1px; }
+.node-halo { fill: rgba(34,211,238,.11); stroke: rgba(34,211,238,.18); stroke-width: 1.5; }
+.node-core { fill: url(#nodeGlow); stroke: rgba(255,255,255,.68); stroke-width: 1; }
+.evo-node.failed .node-core { fill: rgba(251,113,133,.74); }
+.evo-node.unknown .node-core { fill: rgba(251,191,36,.74); }
+.evo-node.pareto .node-halo { stroke: rgba(52,211,153,.72); stroke-width: 2.5; }
+.evo-node.best .node-core { stroke: rgba(52,211,153,.98); stroke-width: 2; }
+.evo-node.latest .node-halo { animation: nodePulse 1.4s ease-in-out infinite; }
+.evo-node.selected .node-halo { stroke: rgba(167,139,250,.95); stroke-width: 4; }
+.node-label { fill: #e2e8f0; font-size: 11px; text-anchor: middle; font-family: ui-monospace, SFMono-Regular, monospace; }
+.node-score { fill: #94a3b8; font-size: 10px; text-anchor: middle; font-family: ui-monospace, SFMono-Regular, monospace; }
+.empty-svg-text { fill: rgba(203,213,225,.68); font-size: 18px; font-family: ui-sans-serif, system-ui; }
+.score-line { fill: none; stroke: #38bdf8; stroke-width: 3; filter: drop-shadow(0 0 10px rgba(56,189,248,.35)); }
+.score-point { fill: #c4b5fd; stroke: rgba(255,255,255,.8); stroke-width: 1; }
+.score-point.best { fill: #34d399; }
+@keyframes nodePulse {
+  0%, 100% { transform: scale(1); opacity: .72; }
+  50% { transform: scale(1.7); opacity: .20; }
+}
+.run-row { border-bottom: 1px solid rgba(148,163,184,.10); }
+.action-line { border-left: 2px solid rgba(34,211,238,.24); padding-left: 12px; }
+.action-dot { width: 9px; height: 9px; border-radius: 50%; background: var(--cyan); box-shadow: 0 0 16px rgba(34,211,238,.7); }
+.action-dot.reviewer { background: var(--violet); box-shadow: 0 0 16px rgba(167,139,250,.7); }
+.action-dot.queue { background: var(--amber); box-shadow: 0 0 16px rgba(251,191,36,.65); }
+.action-dot.store { background: var(--green); box-shadow: 0 0 16px rgba(52,211,153,.65); }
+.q-table__container, .q-table, .q-field__control { background: transparent !important; color: var(--text) !important; }
+.q-table tbody td, .q-table thead th { color: var(--text) !important; border-color: rgba(148,163,184,.11) !important; }
+.q-card { background: transparent; }
+"""
+
+
+def run_dashboard(arena: str | Path, *, host: str = "127.0.0.1", port: int = 8080, poll_s: float = 1.0, title: str = "AI Evolver Live") -> None:
+    try:
+        from nicegui import ui
+    except ModuleNotFoundError as exc:  # pragma: no cover - only hit at runtime without nicegui
+        raise SystemExit("NiceGUI is required for the demo UI. Install with: pip install nicegui") from exc
+
+    bus = FileEventBus(arena)
+    initial_snapshot, _ = bus.poll(force=True)
+    state: dict[str, Any] = {
+        "snapshot": initial_snapshot,
+        "selected_run_id": initial_snapshot.latest_run.run_id if initial_snapshot.latest_run else None,
+        "last_changed": time.time(),
+    }
+
+    ui.dark_mode().enable()
+    ui.add_head_html(f"<style>{DASHBOARD_CSS}</style>")
+
+    def set_selected(run_id: str | None) -> None:
+        state["selected_run_id"] = run_id
+        dashboard.refresh()
+
+    async def tick() -> None:
+        snapshot, changed = bus.poll()
+        if changed:
+            old_latest = state["snapshot"].latest_run.run_id if state["snapshot"].latest_run else None
+            new_latest = snapshot.latest_run.run_id if snapshot.latest_run else None
+            state["snapshot"] = snapshot
+            state["last_changed"] = time.time()
+            if state.get("selected_run_id") in (None, old_latest):
+                state["selected_run_id"] = new_latest
+            dashboard.refresh()
+
+    @ui.page("/")
+    def index() -> None:
+        ui.timer(poll_s, tick)
+        with ui.column().classes("evo-page w-full gap-5 px-5 py-5 md:px-8 md:py-7"):
+            with ui.row().classes("w-full items-center justify-between gap-4"):
+                with ui.column().classes("gap-1"):
+                    ui.label("AI Evolver // live arena").classes("text-3xl md:text-5xl font-black neon tracking-tight")
+                    ui.label("read-only branch telemetry from manifests, metrics, reviews, queue and JSONL events").classes("tiny")
+                with ui.row().classes("items-center gap-2"):
+                    ui.html('<span class="pill good"><span style="width:7px;height:7px;border-radius:50%;background:#34d399;box-shadow:0 0 10px #34d399"></span>watching filesystem</span>')
+                    ui.label(str(Path(arena).expanduser().resolve())).classes("mono tiny")
+            dashboard()
+
+    @ui.refreshable
+    def dashboard() -> None:
+        snapshot: ArenaSnapshot = state["snapshot"]
+        selected_id = state.get("selected_run_id")
+        if selected_id not in snapshot.runs_by_id:
+            selected_id = snapshot.latest_run.run_id if snapshot.latest_run else None
+            state["selected_run_id"] = selected_id
+        selected = snapshot.runs_by_id.get(selected_id) if selected_id else snapshot.latest_run
+
+        render_top_stats(snapshot)
+
+        with ui.grid(columns=12).classes("w-full gap-5"):
+            with ui.card().classes("glass col-span-12 xl:col-span-8 rounded-[28px] p-4"):
+                with ui.row().classes("w-full justify-between items-center mb-2"):
+                    with ui.column().classes("gap-0"):
+                        ui.label("branch constellation").classes("text-lg font-bold")
+                        ui.label("new children appear as glowing nodes; Pareto nodes get a green orbit").classes("tiny")
+                    ui.select(
+                        options=[r.run_id for r in reversed(snapshot.runs[-40:])],
+                        value=selected_id,
+                        label="inspect run",
+                        on_change=lambda e: set_selected(e.value),
+                    ).props("dense outlined dark").classes("w-56")
+                ui.html(render_branch_svg(snapshot, selected_id)).classes("w-full")
+
+            with ui.card().classes("glass col-span-12 xl:col-span-4 rounded-[28px] p-5"):
+                render_decision_panel(selected)
+
+        with ui.grid(columns=12).classes("w-full gap-5"):
+            with ui.card().classes("glass col-span-12 lg:col-span-7 rounded-[28px] p-4"):
+                with ui.row().classes("w-full justify-between items-center mb-2"):
+                    ui.label("score skyline").classes("text-lg font-bold")
+                    ui.html(f'<span class="pill">rev {snapshot.revision} · refreshed {_ago(state["last_changed"])} ago</span>')
+                ui.html(render_score_svg(snapshot.runs)).classes("w-full")
+
+            with ui.card().classes("glass col-span-12 lg:col-span-5 rounded-[28px] p-4"):
+                render_metric_strip(selected)
+
+        with ui.grid(columns=12).classes("w-full gap-5"):
+            with ui.card().classes("glass col-span-12 xl:col-span-7 rounded-[28px] p-4"):
+                render_leaderboard(snapshot)
+            with ui.card().classes("glass col-span-12 xl:col-span-5 rounded-[28px] p-4"):
+                render_queue(snapshot)
+
+        with ui.grid(columns=12).classes("w-full gap-5"):
+            with ui.card().classes("glass col-span-12 xl:col-span-6 rounded-[28px] p-4"):
+                render_actions(snapshot)
+            with ui.card().classes("glass col-span-12 xl:col-span-6 rounded-[28px] p-4"):
+                render_run_detail(selected)
+
+    def render_top_stats(snapshot: ArenaSnapshot) -> None:
+        runs = snapshot.runs
+        succeeded = sum(1 for r in runs if r.status == "succeeded")
+        failed = sum(1 for r in runs if r.status == "failed")
+        queued = sum(1 for q in snapshot.queue if q.get("status") == "queued")
+        running = sum(1 for q in snapshot.queue if q.get("status") == "running") + sum(1 for r in runs if r.status in {"created", "running", "unknown"})
+        best = snapshot.best_run
+        latest = snapshot.latest_run
+        stats = [
+            ("runs", len(runs), "registered branches", "good"),
+            ("best score", _fmt(best.score if best else None), best.run_id if best else "no score yet", "good"),
+            ("queue", queued, f"{running} running · {len(snapshot.queue)} total", "warn"),
+            ("failed", failed, f"{succeeded} succeeded", "bad" if failed else "good"),
+            ("latest", _short_run(latest.run_id) if latest else "—", latest.status if latest else "waiting", "good"),
+        ]
+        with ui.grid(columns=5).classes("w-full gap-4"):
+            for label, value, sub, tone in stats:
+                with ui.card().classes("stat-card col-span-5 sm:col-span-1"):
+                    ui.label(str(value)).classes("stat-value neon mono" if label in {"best score", "latest"} else "stat-value mono")
+                    ui.label(label).classes("stat-label")
+                    ui.html(f'<span class="pill {tone}">{html.escape(str(sub))}</span>')
+
+    def render_decision_panel(run: RunView | None) -> None:
+        ui.label("decision cockpit").classes("text-lg font-bold")
+        if not run:
+            ui.label("No run selected.").classes("tiny")
+            return
+        review = run.review
+        recommendation = review.get("branch_recommendation") or ("continue" if run.status == "succeeded" else "investigate")
+        confidence = review.get("confidence")
+        improvement = review.get("is_improvement")
+        tone = "good" if recommendation in {"continue", "exploit", "retry"} or improvement is True else "warn" if run.status != "failed" else "bad"
+        ui.html(f'<div class="pill {tone} mono">{html.escape(str(recommendation))} · confidence {_fmt(confidence)}</div>').classes("my-2")
+        with ui.column().classes("gap-3 mt-3"):
+            _mini_block("run", f"{run.run_id} · {run.status} · gen {run.generation}")
+            _mini_block("mutation", str(run.data.get("mutation_summary") or run.data.get("mutation_type") or "—"))
+            _mini_block("observation", str(review.get("observation") or run.data.get("observation") or "No review observation yet."), clamp=True)
+            _mini_block("next belief", str(review.get("next_belief") or run.data.get("next_belief") or "No next belief yet."), clamp=True)
+        recs = _as_list(review.get("recommended_next_mutations"))[:3]
+        if recs:
+            ui.label("recommended branches").classes("mt-4 text-sm font-bold text-slate-200")
+            for rec in recs:
+                ui.html(
+                    '<div class="mt-2 p-3 rounded-xl" style="background:rgba(2,6,23,.34);border:1px solid rgba(148,163,184,.10)">'
+                    f'<div class="pill warn mono">p={html.escape(_fmt(rec.get("priority")))} · {html.escape(str(rec.get("mutation_type") or "mutation"))}</div>'
+                    f'<div class="tiny mt-2" style="color:#cbd5e1">{html.escape(str(rec.get("description") or rec.get("proposed_mutation") or ""))}</div>'
+                    '</div>'
+                )
+
+    def render_metric_strip(run: RunView | None) -> None:
+        ui.label("selected branch metrics").classes("text-lg font-bold mb-2")
+        if not run:
+            ui.label("No metrics yet.").classes("tiny")
+            return
+        metrics = [
+            ("score", run.data.get("score")),
+            ("val acc", run.data.get("val_accuracy")),
+            ("loss", run.data.get("val_loss")),
+            ("params", run.data.get("parameter_count")),
+            ("bytes", run.data.get("model_bytes")),
+            ("lat ms", run.data.get("latency_ms")),
+            ("train s", run.data.get("train_seconds")),
+            ("dry run", run.data.get("dry_run_passed")),
+        ]
+        with ui.grid(columns=4).classes("w-full gap-3"):
+            for label, value in metrics:
+                with ui.column().classes("gap-0 p-3 rounded-2xl").style("background:rgba(2,6,23,.34);border:1px solid rgba(148,163,184,.10)"):
+                    ui.label(_fmt(value)).classes("mono text-xl font-black text-cyan-100")
+                    ui.label(label).classes("tiny uppercase tracking-widest")
+
+    def render_leaderboard(snapshot: ArenaSnapshot) -> None:
+        ui.label("leaderboard / Pareto hints").classes("text-lg font-bold mb-2")
+        pareto = pareto_front(snapshot.runs)
+        rows = []
+        for idx, run in enumerate(leaderboard(snapshot.runs, limit=10), 1):
+            rows.append(
+                {
+                    "#": idx,
+                    "run": run.run_id,
+                    "status": run.status,
+                    "score": _fmt(run.score),
+                    "acc": _fmt(run.data.get("val_accuracy")),
+                    "params": _compact(run.data.get("parameter_count")),
+                    "ms": _fmt(run.data.get("latency_ms")),
+                    "pareto": "✦" if run.run_id in pareto else "",
+                    "idea": _clip(str(run.data.get("mutation_summary") or run.data.get("mutation_type") or ""), 64),
+                }
+            )
+        if not rows:
+            ui.label("No runs yet.").classes("tiny")
+            return
+        ui.table(
+            columns=[
+                {"name": "#", "label": "#", "field": "#", "align": "left"},
+                {"name": "run", "label": "run", "field": "run", "align": "left"},
+                {"name": "score", "label": "score", "field": "score", "align": "right"},
+                {"name": "acc", "label": "acc", "field": "acc", "align": "right"},
+                {"name": "params", "label": "params", "field": "params", "align": "right"},
+                {"name": "ms", "label": "ms", "field": "ms", "align": "right"},
+                {"name": "pareto", "label": "P", "field": "pareto", "align": "center"},
+                {"name": "idea", "label": "idea", "field": "idea", "align": "left"},
+            ],
+            rows=rows,
+            row_key="run",
+        ).props("flat dense hide-bottom dark").classes("w-full mono")
+
+    def render_queue(snapshot: ArenaSnapshot) -> None:
+        ui.label("mutation queue").classes("text-lg font-bold mb-2")
+        active = [q for q in snapshot.queue if q.get("status") in {"queued", "running"}]
+        done = len([q for q in snapshot.queue if q.get("status") == "done"])
+        ui.html(f'<span class="pill warn">{len(active)} active · {done} done · {len(snapshot.queue)} total</span>').classes("mb-2")
+        if not active:
+            ui.label("Queue is empty or all items are done.").classes("tiny")
+            return
+        for item in active[:7]:
+            status = item.get("status") or "queued"
+            tone = "good" if status == "running" else "warn"
+            ui.html(
+                '<div class="mt-3 p-3 rounded-2xl" style="background:rgba(2,6,23,.34);border:1px solid rgba(148,163,184,.10)">'
+                f'<div class="pill {tone} mono">{html.escape(str(status))} · p={html.escape(_fmt(item.get("priority")))} · {html.escape(str(item.get("mutation_type") or "mutation"))}</div>'
+                f'<div class="tiny mt-2">from {html.escape(str(item.get("source_run_id") or "—"))} · {html.escape(str(item.get("item_id") or ""))}</div>'
+                f'<div style="color:#dbeafe;font-size:.86rem;margin-top:.35rem;line-height:1.35">{html.escape(_clip(str(item.get("proposed_mutation") or ""), 220))}</div>'
+                '</div>'
+            )
+
+    def render_actions(snapshot: ArenaSnapshot) -> None:
+        ui.label("agent / executor / reviewer stream").classes("text-lg font-bold mb-3")
+        actions = recent_actions(snapshot, limit=26)
+        if not actions:
+            ui.label("No events yet. Events from JSONL files will appear here as the loop runs.").classes("tiny")
+            return
+        with ui.column().classes("gap-3 max-h-[620px] overflow-y-auto pr-2"):
+            for action in actions:
+                actor = html.escape(str(action.get("actor") or "event"))
+                with ui.row().classes("w-full gap-3 items-start"):
+                    ui.html(f'<span class="action-dot {actor}"></span>').classes("mt-2")
+                    with ui.column().classes("gap-0 action-line"):
+                        ui.label(str(action.get("title") or "event")).classes("font-semibold text-slate-100")
+                        ui.label(str(action.get("detail") or "")).classes("tiny")
+                        ui.label(f"{actor} · {_ago_ts(action.get('ts'))}").classes("tiny mono")
+
+    def render_run_detail(run: RunView | None) -> None:
+        ui.label("branch dossier").classes("text-lg font-bold mb-3")
+        if not run:
+            ui.label("Select a run to inspect its dossier.").classes("tiny")
+            return
+        badges = [
+            f"status={run.status}",
+            f"parent={run.parent_id or 'root'}",
+            f"gen={run.generation}",
+            f"type={run.data.get('mutation_type') or 'unknown'}",
+        ]
+        ui.html(" ".join(f'<span class="pill mono">{html.escape(b)}</span>' for b in badges))
+        with ui.column().classes("gap-3 mt-4"):
+            _mini_block("hypothesis", str(run.data.get("hypothesis") or run.mutation.get("hypothesis") or "—"), clamp=True)
+            _mini_block("summary", str(run.data.get("mutation_summary") or run.mutation.get("mutation_summary") or "—"), clamp=True)
+            if run.data.get("error_type"):
+                _mini_block("error", str(run.data.get("error_type")), clamp=True)
+            paths = [
+                ("manifest", Path(str(run.data.get("artifact_path") or "")) / "manifest.json"),
+                ("metrics", Path(str(run.data.get("metrics_path") or ""))),
+                ("events", Path(str(run.data.get("events_path") or ""))),
+                ("review", Path(str(run.data.get("artifact_path") or "")) / "ds_review.json"),
+            ]
+            path_html = "".join(
+                f'<div class="tiny mono">{html.escape(label)}: {html.escape(str(path))}</div>'
+                for label, path in paths
+                if str(path) not in {".", ""}
+            )
+            ui.html(f'<div class="mt-1 p-3 rounded-xl" style="background:rgba(2,6,23,.28)">{path_html}</div>')
+
+    def _mini_block(label: str, value: str, *, clamp: bool = False) -> None:
+        safe_value = html.escape(value or "—")
+        max_height = "max-height:7.5rem;overflow:hidden" if clamp else ""
+        ui.html(
+            f'<div class="p-3 rounded-2xl" style="background:rgba(2,6,23,.34);border:1px solid rgba(148,163,184,.10)">'
+            f'<div class="tiny uppercase tracking-widest">{html.escape(label)}</div>'
+            f'<div style="color:#e2e8f0;line-height:1.38;font-size:.88rem;{max_height}">{safe_value}</div>'
+            '</div>'
+        )
+
+    ui.run(host=host, port=port, title=title, favicon="🧬", reload=False, show=False)
+
+
+# -----------------------------------------------------------------------------
+# Utility helpers
+# -----------------------------------------------------------------------------
+
+
+def _read_json(path: Path, default: Any) -> Any:
+    try:
+        if not path.exists():
+            return default
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return default
+
+
+def _read_jsonl(path: Path) -> list[dict[str, Any]]:
+    if not path.exists():
+        return []
+    rows: list[dict[str, Any]] = []
+    try:
+        for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                item = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(item, dict):
+                rows.append(item)
+    except Exception:
+        return []
+    return rows
+
+
+def _as_dict(value: Any) -> dict[str, Any]:
+    return dict(value) if isinstance(value, dict) else {}
+
+
+def _as_list(value: Any) -> list[dict[str, Any]]:
+    if not isinstance(value, list):
+        return []
+    return [dict(x) for x in value if isinstance(x, dict)]
+
+
+def _float(value: Any, default: float | None = None) -> float:
+    try:
+        if value in (None, "", "None"):
+            raise ValueError
+        return float(value)
+    except (TypeError, ValueError):
+        return float(default) if default is not None else math.nan
+
+
+def _int(value: Any, default: int = 0) -> int:
+    try:
+        if value in (None, "", "None"):
+            raise ValueError
+        return int(float(value))
+    except (TypeError, ValueError):
+        return default
+
+
+def _fmt(value: Any) -> str:
+    if isinstance(value, bool):
+        return "yes" if value else "no"
+    try:
+        if value in (None, "", "None"):
+            return "—"
+        x = float(value)
+    except (TypeError, ValueError):
+        return str(value) if value not in (None, "") else "—"
+    if not math.isfinite(x):
+        return "—"
+    if abs(x) >= 100_000:
+        return _compact(x)
+    if abs(x) >= 100:
+        return f"{x:,.0f}"
+    if abs(x) >= 10:
+        return f"{x:.2f}".rstrip("0").rstrip(".")
+    return f"{x:.4f}".rstrip("0").rstrip(".")
+
+
+def _compact(value: Any) -> str:
+    try:
+        x = float(value)
+    except (TypeError, ValueError):
+        return "—"
+    sign = "-" if x < 0 else ""
+    x = abs(x)
+    if x >= 1_000_000:
+        return f"{sign}{x / 1_000_000:.1f}M"
+    if x >= 1_000:
+        return f"{sign}{x / 1_000:.1f}k"
+    return f"{sign}{x:.0f}"
+
+
+def _clip(value: str, limit: int) -> str:
+    value = " ".join((value or "").split())
+    return value if len(value) <= limit else value[: limit - 1].rstrip() + "…"
+
+
+def _run_num(run_id: str) -> int:
+    m = re.search(r"(\d+)$", run_id or "")
+    return int(m.group(1)) if m else 0
+
+
+def _short_run(run_id: str) -> str:
+    if not run_id:
+        return "—"
+    return run_id.replace("run_", "#")
+
+
+def _timestamp_key(row: dict[str, Any]) -> float:
+    for key in ["completed_at", "manifest_written_at", "created_at"]:
+        ts = _parse_ts(row.get(key))
+        if ts > 0:
+            return ts
+    return float(_run_num(str(row.get("run_id") or "")))
+
+
+def _parse_ts(value: Any) -> float:
+    if not value:
+        return 0.0
+    if isinstance(value, (int, float)):
+        return float(value)
+    raw = str(value).strip()
+    if not raw:
+        return 0.0
+    try:
+        # Accept both Z and +00:00 forms without adding dateutil.
+        from datetime import datetime
+
+        dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        return dt.timestamp()
+    except Exception:
+        return 0.0
+
+
+def _ago(start: float) -> str:
+    delta = max(0.0, time.time() - start)
+    if delta < 1:
+        return "now"
+    if delta < 60:
+        return f"{delta:.0f}s"
+    if delta < 3600:
+        return f"{delta / 60:.0f}m"
+    return f"{delta / 3600:.1f}h"
+
+
+def _ago_ts(value: Any) -> str:
+    ts = _parse_ts(value)
+    if ts <= 0:
+        return "time unknown"
+    return _ago(ts)
+
+
+def _short_json(event: dict[str, Any]) -> str:
+    try:
+        return _clip(json.dumps(event, sort_keys=True, default=str), 160)
+    except Exception:
+        return _clip(str(event), 160)
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Read-only NiceGUI dashboard for AI Evolver arenas")
+    parser.add_argument("--arena", default=".arena", help="arena state folder")
+    parser.add_argument("--host", default="127.0.0.1")
+    parser.add_argument("--port", type=int, default=8080)
+    parser.add_argument("--poll-s", type=float, default=1.0, help="filesystem polling interval")
+    parser.add_argument("--title", default="AI Evolver Live")
+    args = parser.parse_args()
+    run_dashboard(args.arena, host=args.host, port=args.port, poll_s=args.poll_s, title=args.title)
+
+
+if __name__ == "__main__":
+    main()

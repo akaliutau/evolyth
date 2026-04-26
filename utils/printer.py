@@ -45,10 +45,10 @@ def dump_folder_contents(folder_path, output_filename, extensions):
 # ==========================================
 if __name__ == "__main__":
     # 1. Set the target folder path (use '.' for current directory)
-    TARGET_FOLDER = Path("./examples")
+    TARGET_FOLDER = Path("./core")
 
     # 2. Set the name of the final aggregated file
-    OUTPUT_FILE = "examples_dump.txt"
+    OUTPUT_FILE = "core_dump.txt"
 
     # 3. Define the extensions you want to include
     ALLOWED_EXTENSIONS = ['.py', '.js', '.j2', '.md', '.txt']
