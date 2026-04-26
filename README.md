@@ -35,7 +35,7 @@
 
 ---
 
-## Why Evolyth exists
+## [Why Evolyth exists](#why-evolyth-exists)
 
 Modern AI coding agents can write surprisingly good experimental code. The missing piece is not code generation; it is **scientific discipline**.
 
@@ -107,7 +107,7 @@ The loop is deliberately conservative. Evolyth is not trying to let an agent rew
 
 ---
 
-## [What Evolyth gives you](#why-evolyth-exists)
+## What Evolyth gives you
 
 ### Autonomous model R&D
 
