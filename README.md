@@ -107,19 +107,22 @@ The loop is deliberately conservative. Evolyth is not trying to let an agent rew
 
 ---
 
-## What Evolyth gives you
+## What Evolyth offers
 
 ### Autonomous model R&D
 
-Run a multi-step architecture search loop where a coding agent proposes changes, the executor tests them, and a reviewer decides whether to continue, branch, or abandon an idea.
+Run a multi-step architecture search loop where a coding agent proposes changes, the executor tests them, 
+and a reviewer decides whether to continue, branch, or abandon an idea.
 
 ### A durable experiment arena
 
-Each run is preserved under `.arena/runs/<run_id>/` with the model snapshot, metrics, events, stdout/stderr, manifest, mutation metadata, reviewer notes, and context.
+Each run is preserved under `.arena/runs/<run_id>/` with the model snapshot, metrics, events, stdout/stderr, manifest, mutation metadata, 
+reviewer notes, and context.
 
 ### Pluggable AI workers
 
-Use Claude Code, a custom external command, or a no-op agent. The mutation and review interfaces are JSON contracts, so you can plug in other LLMs or deterministic tools.
+Use Claude Code, a custom external command, or a no-op agent. The mutation and review interfaces are JSON contracts, 
+so you can plug in other LLMs or deterministic tools.
 
 ### Local and cloud execution
 
@@ -229,7 +232,7 @@ python cli.py --arena .arena evolve \
 
 ## [Research Problem contract](#research-problem-contract)
 
-Evolyth's user-facing input is a **Research Problem folder**.
+Evolyth's prime input is a **Research Problem folder**.
 
 Minimum RP structure:
 
@@ -239,20 +242,6 @@ my_rp/
   train_eval.py       # executable training/evaluation entrypoint
   model.py            # mutable model file, edited by the mutation agent
 ```
-
-By default, the RP command is:
-
-```text
-python train_eval.py --dataset synthetic --run-id <run_id>
-```
-
-Smoke mode uses:
-
-```text
-python train_eval.py --dry-run --dataset synthetic --run-id <run_id>
-```
-
-You can override the defaults with `rp_contract.json`.
 
 ### Expected outputs
 
