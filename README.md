@@ -82,6 +82,12 @@ This separation is the reason the loop stays debuggable. A failed reviewer does 
 
 ## Diagram 2 — Evolution loop
 
+<p align="center">
+  <img src="docs/evolyth_diag_2_sm.jpg" alt="Evolyth system architecture" width="700">
+</p>
+
+<p align="center"><em>Diagram 2: Pareto frontier.</em></p>
+
 At a high level, one `evolve` step is:
 
 ```text
@@ -101,7 +107,7 @@ The loop is deliberately conservative. Evolyth is not trying to let an agent rew
 
 ---
 
-## What Evolyth gives you
+## [What Evolyth gives you](#why-evolyth-exists)
 
 ### Autonomous model R&D
 
@@ -125,7 +131,7 @@ Use the NiceGUI dashboard to watch the arena evolve, or query the small API for 
 
 ---
 
-## Quickstart
+## [Quickstart](#quickstart)
 
 ### 1. Clone and install
 
@@ -151,7 +157,7 @@ pip install nicegui
 curl -fsSL https://claude.ai/install.sh | bash
 ```
 
-Then configure your key with either a `.env` file or the Claude CLI:
+Then configure key with either a `.env` file or the Claude CLI:
 
 ```bash
 claude config set apiKey "sk-ant-..."
@@ -231,7 +237,7 @@ python cli.py --arena .arena evolve \
 
 ---
 
-## Research Problem contract
+## [Research Problem contract](#research-problem-contract)
 
 Evolyth's user-facing input is a **Research Problem folder**.
 
@@ -289,7 +295,7 @@ This artifact-first contract is what lets Evolyth recover from partial failures 
 
 ---
 
-## Autonomous loop in detail
+## [Autonomous loop in detail](#how-it-works)
 
 ### 1. Parent selection
 
@@ -607,7 +613,7 @@ Evolyth is a good fit when you have:
 - enough experiment budget to test many small variants;
 - a need to inspect why one branch improved or regressed.
 
-It is not a replacement for rigorous final evaluation. Use it to generate and triage candidates, then rerun promising results under stricter experimental controls.
+Useful to generate and triage candidates, then rerun promising results under stricter experimental controls.
 
 ---
 
