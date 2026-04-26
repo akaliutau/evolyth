@@ -279,7 +279,7 @@ def _parse_jsonish(text: str) -> dict[str, Any]:
         pass
     start = text.find("{")
     end = text.rfind("}")
-    if start >= 0 and end > start:
+    if 0 <= start < end:
         parsed = json.loads(text[start : end + 1])
         return parsed if isinstance(parsed, dict) else {"result": parsed}
     raise ValueError(f"Could not parse JSON output: {text[:1000]}")
