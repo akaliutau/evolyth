@@ -78,7 +78,6 @@ def main() -> None:
     serve.add_argument("--host", default="127.0.0.1")
     serve.add_argument("--port", type=int, default=8000)
 
-
     demo_ui = sub.add_parser("demo-ui", help="serve read-only NiceGUI dashboard directly from .arena files")
     demo_ui.add_argument("--host", default="127.0.0.1")
     demo_ui.add_argument("--port", type=int, default=8080)
@@ -113,8 +112,9 @@ def main() -> None:
 
         uvicorn.run(create_app(arena), host=args.host, port=args.port)
     elif args.cmd == "demo-ui":
-        from core.ui_demo import run_dashboard
-        run_dashboard(arena, host=args.host, port=args.port, poll_s=args.poll_s, title=args.title)
+       from core.ui_demo import run_dashboard
+       run_dashboard(arena, host=args.host, port=args.port, poll_s=args.poll_s, title=args.title)
+
 
 def _load_cli_env(args: argparse.Namespace) -> None:
     rp_path = getattr(args, "rp", None)

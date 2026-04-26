@@ -26,6 +26,7 @@ import json
 import math
 import re
 import time
+from urllib.parse import quote
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable
@@ -385,7 +386,8 @@ def render_branch_svg(snapshot: ArenaSnapshot, selected_run_id: str | None = Non
         f'<svg viewBox="0 0 {width} {height}" class="evo-svg" role="img" aria-label="Evolution branch graph">',
         '<defs>',
         '<radialGradient id="nodeGlow" cx="45%" cy="35%" r="70%"><stop offset="0%" stop-color="#ffffff" stop-opacity="0.95"/><stop offset="45%" stop-color="#8b5cf6" stop-opacity="0.9"/><stop offset="100%" stop-color="#06b6d4" stop-opacity="0.95"/></radialGradient>',
-        '<linearGradient id="edgeGrad" x1="0" x2="1"><stop offset="0%" stop-color="#22d3ee" stop-opacity="0.15"/><stop offset="100%" stop-color="#a78bfa" stop-opacity="0.75"/></linearGradient>',
+        '<linearGradient id="edgeGrad" x1="0" x2="1"><stop offset="0%" stop-color="#22d3ee" stop-opacity="0.55"/><stop offset="100%" stop-color="#a78bfa" stop-opacity="0.95"/></linearGradient>',
+        '<marker id="edgeArrow" markerWidth="10" markerHeight="10" refX="7" refY="3" orient="auto" markerUnits="strokeWidth"><path d="M0,0 L0,6 L7,3 z" class="edge-arrow"/></marker>',
         '</defs>',
         '<rect x="0" y="0" width="100%" height="100%" rx="26" class="svg-bg"/>',
     ]
@@ -403,9 +405,9 @@ def render_branch_svg(snapshot: ArenaSnapshot, selected_run_id: str | None = Non
         x1, y1 = coords[run.parent_id]
         x2, y2 = coords[run.run_id]
         mid = (x1 + x2) / 2
-        parts.append(
-            f'<path d="M{x1 + 18:.1f},{y1:.1f} C{mid:.1f},{y1:.1f} {mid:.1f},{y2:.1f} {x2 - 18:.1f},{y2:.1f}" class="evo-edge"/>'
-        )
+        edge_d = f'M{x1 + 18:.1f},{y1:.1f} C{mid:.1f},{y1:.1f} {mid:.1f},{y2:.1f} {x2 - 18:.1f},{y2:.1f}'
+        parts.append(f'<path d="{edge_d}" class="evo-edge-glow"/>')
+        parts.append(f'<path d="{edge_d}" class="evo-edge" marker-end="url(#edgeArrow)"/>')
 
     for run in runs:
         x, y = coords[run.run_id]
@@ -426,15 +428,25 @@ def render_branch_svg(snapshot: ArenaSnapshot, selected_run_id: str | None = Non
         )
         label = html.escape(_short_run(run.run_id))
         score = html.escape(_fmt(run.score))
+        safe_href = quote(run.run_id)
+        parts.append(f'<a class="node-link" href="/?run={safe_href}" aria-label="Inspect {html.escape(run.run_id, quote=True)}">')
+        parts.append(f'<g class="{" ".join(classes)}">')
+        parts.append(f'<title>{title}</title>')
+        if run.run_id == latest:
+            parts.append(
+                f'<circle cx="{x:.1f}" cy="{y:.1f}" r="25" class="node-pulse">'
+                '<animate attributeName="r" values="24;36;24" dur="1.8s" repeatCount="indefinite"/>'
+                '<animate attributeName="opacity" values=".68;.10;.68" dur="1.8s" repeatCount="indefinite"/>'
+                '</circle>'
+            )
         parts.extend(
             [
-                f'<g class="{" ".join(classes)}">',
-                f'<title>{title}</title>',
                 f'<circle cx="{x:.1f}" cy="{y:.1f}" r="24" class="node-halo"/>',
                 f'<circle cx="{x:.1f}" cy="{y:.1f}" r="15" class="node-core"/>',
                 f'<text x="{x:.1f}" y="{y + 36:.1f}" class="node-label">{label}</text>',
                 f'<text x="{x:.1f}" y="{y + 52:.1f}" class="node-score">{score}</text>',
                 '</g>',
+                '</a>',
             ]
         )
     parts.append('</svg>')
@@ -487,15 +499,46 @@ def _empty_svg(message: str, *, height: int = 330) -> str:
 # -----------------------------------------------------------------------------
 
 
+SCROLL_PRESERVE_JS = r"""
+<script>
+(function () {
+  const KEY = 'ai-evolver-demo-scroll-y';
+  function currentY() {
+    return window.scrollY || document.documentElement.scrollTop || document.body.scrollTop || 0;
+  }
+  window.addEventListener('click', function (event) {
+    const target = event.target;
+    const link = target && target.closest ? target.closest('a.node-link') : null;
+    if (link) {
+      sessionStorage.setItem(KEY, String(currentY()));
+    }
+  }, true);
+  function restore() {
+    const raw = sessionStorage.getItem(KEY);
+    if (raw === null) return;
+    sessionStorage.removeItem(KEY);
+    const y = Number(raw);
+    if (!Number.isFinite(y)) return;
+    requestAnimationFrame(function () { window.scrollTo(0, y); });
+    setTimeout(function () { window.scrollTo(0, y); }, 50);
+    setTimeout(function () { window.scrollTo(0, y); }, 180);
+  }
+  window.addEventListener('load', restore);
+  document.addEventListener('DOMContentLoaded', restore);
+})();
+</script>
+"""
+
+
 DASHBOARD_CSS = r"""
 :root {
-  --bg0: #020617;
-  --bg1: #0f172a;
-  --panel: rgba(15, 23, 42, 0.76);
-  --panel2: rgba(15, 23, 42, 0.52);
-  --line: rgba(148, 163, 184, 0.18);
-  --text: #e2e8f0;
-  --muted: #94a3b8;
+  --bg0: #182235;
+  --bg1: #223047;
+  --panel: rgba(30, 41, 59, 0.72);
+  --panel2: rgba(51, 65, 85, 0.44);
+  --line: rgba(203, 213, 225, 0.22);
+  --text: #eef6ff;
+  --muted: #b9c6d8;
   --cyan: #22d3ee;
   --violet: #a78bfa;
   --green: #34d399;
@@ -504,24 +547,23 @@ DASHBOARD_CSS = r"""
 }
 body.body--dark, body {
   background:
-    radial-gradient(circle at 10% 5%, rgba(34, 211, 238, .18), transparent 31rem),
-    radial-gradient(circle at 80% 8%, rgba(167, 139, 250, .22), transparent 35rem),
-    radial-gradient(circle at 35% 95%, rgba(52, 211, 153, .10), transparent 28rem),
-    var(--bg0) !important;
+    radial-gradient(circle at 12% 4%, rgba(34, 211, 238, .18), transparent 32rem),
+    radial-gradient(circle at 82% 8%, rgba(167, 139, 250, .20), transparent 34rem),
+    linear-gradient(180deg, #25324a 0%, #182235 48%, #111827 100%) !important;
   color: var(--text);
 }
 .evo-page { min-height: 100vh; color: var(--text); }
 .glass {
-  background: linear-gradient(135deg, rgba(15,23,42,.84), rgba(15,23,42,.52));
+  background: linear-gradient(135deg, rgba(30,41,59,.74), rgba(51,65,85,.42));
   border: 1px solid var(--line);
-  box-shadow: 0 24px 80px rgba(0,0,0,.32), inset 0 1px 0 rgba(255,255,255,.05);
+  box-shadow: 0 20px 60px rgba(3,7,18,.22), inset 0 1px 0 rgba(255,255,255,.08);
   backdrop-filter: blur(18px);
 }
 .stat-card {
   min-height: 118px;
   border-radius: 24px;
   padding: 18px;
-  background: linear-gradient(135deg, rgba(15, 23, 42, .86), rgba(30, 41, 59, .54));
+  background: linear-gradient(135deg, rgba(30, 41, 59, .74), rgba(51, 65, 85, .42));
   border: 1px solid rgba(148,163,184,.16);
 }
 .stat-value { font-size: 2.15rem; line-height: 1; font-weight: 800; letter-spacing: -.04em; }
@@ -537,18 +579,29 @@ body.body--dark, body {
 .pill.good { border-color: rgba(52,211,153,.36); color: #bbf7d0; }
 .pill.warn { border-color: rgba(251,191,36,.38); color: #fde68a; }
 .pill.bad { border-color: rgba(251,113,133,.38); color: #fecdd3; }
+.ribbon .pill {
+  font-size: 1.125rem;
+  padding: 8px 15px;
+  gap: 9px;
+  border-width: 1.25px;
+}
+.ribbon .pill .mono { font-size: 1.05em; font-weight: 900; }
 .evo-svg, .score-svg { width: 100%; height: auto; display: block; }
-.svg-bg { fill: rgba(2,6,23,.38); stroke: rgba(148,163,184,.14); }
+.svg-bg { fill: rgba(15,23,42,.24); stroke: rgba(203,213,225,.18); }
 .gen-line { stroke: rgba(148,163,184,.10); stroke-dasharray: 3 8; }
 .gen-label, .axis-text { fill: rgba(203,213,225,.62); font-size: 12px; font-family: ui-monospace, SFMono-Regular, monospace; }
-.evo-edge { fill: none; stroke: url(#edgeGrad); stroke-width: 2.1px; }
+.evo-edge-glow { fill: none; stroke: rgba(34,211,238,.24); stroke-width: 8px; filter: drop-shadow(0 0 10px rgba(34,211,238,.36)); }
+.evo-edge { fill: none; stroke: url(#edgeGrad); stroke-width: 3.4px; stroke-linecap: round; stroke-linejoin: round; opacity: .96; }
+.edge-arrow { fill: #a78bfa; opacity: .94; }
 .node-halo { fill: rgba(34,211,238,.11); stroke: rgba(34,211,238,.18); stroke-width: 1.5; }
 .node-core { fill: url(#nodeGlow); stroke: rgba(255,255,255,.68); stroke-width: 1; }
 .evo-node.failed .node-core { fill: rgba(251,113,133,.74); }
 .evo-node.unknown .node-core { fill: rgba(251,191,36,.74); }
 .evo-node.pareto .node-halo { stroke: rgba(52,211,153,.72); stroke-width: 2.5; }
 .evo-node.best .node-core { stroke: rgba(52,211,153,.98); stroke-width: 2; }
-.evo-node.latest .node-halo { animation: nodePulse 1.4s ease-in-out infinite; }
+.evo-node { cursor: pointer; }
+.node-link { text-decoration: none; }
+.node-pulse { fill: none; stroke: rgba(34,211,238,.72); stroke-width: 2; pointer-events: none; }
 .evo-node.selected .node-halo { stroke: rgba(167,139,250,.95); stroke-width: 4; }
 .node-label { fill: #e2e8f0; font-size: 11px; text-anchor: middle; font-family: ui-monospace, SFMono-Regular, monospace; }
 .node-score { fill: #94a3b8; font-size: 10px; text-anchor: middle; font-family: ui-monospace, SFMono-Regular, monospace; }
@@ -557,8 +610,8 @@ body.body--dark, body {
 .score-point { fill: #c4b5fd; stroke: rgba(255,255,255,.8); stroke-width: 1; }
 .score-point.best { fill: #34d399; }
 @keyframes nodePulse {
-  0%, 100% { transform: scale(1); opacity: .72; }
-  50% { transform: scale(1.7); opacity: .20; }
+  0%, 100% { opacity: .72; }
+  50% { opacity: .20; }
 }
 .run-row { border-bottom: 1px solid rgba(148,163,184,.10); }
 .action-line { border-left: 2px solid rgba(34,211,238,.24); padding-left: 12px; }
@@ -602,17 +655,18 @@ def run_dashboard(arena: str | Path, *, host: str = "127.0.0.1", port: int = 808
             dashboard.refresh()
 
     @ui.page("/")
-    def index() -> None:
+    def index(run: str = "") -> None:
+        if run in state["snapshot"].runs_by_id:
+            state["selected_run_id"] = run
+
         ui.dark_mode().enable()
-        ui.add_head_html(f"<style>{DASHBOARD_CSS}</style>")
+        ui.add_head_html(f"<style>{DASHBOARD_CSS}</style>{SCROLL_PRESERVE_JS}")
         ui.timer(poll_s, tick)
-        with ui.column().classes("evo-page w-full gap-5 px-5 py-5 md:px-8 md:py-7"):
+        with ui.column().classes("evo-page w-full gap-4 px-5 py-5 md:px-8 md:py-7"):
             with ui.row().classes("w-full items-center justify-between gap-4"):
-                with ui.column().classes("gap-1"):
-                    ui.label("AI Evolver // live arena").classes("text-3xl md:text-5xl font-black neon tracking-tight")
-                    ui.label("read-only branch telemetry from manifests, metrics, reviews, queue and JSONL events").classes("tiny")
+                ui.label("AI Evolver // live arena").classes("text-3xl md:text-5xl font-black neon tracking-tight")
                 with ui.row().classes("items-center gap-2"):
-                    ui.html('<span class="pill good"><span style="width:7px;height:7px;border-radius:50%;background:#34d399;box-shadow:0 0 10px #34d399"></span>watching filesystem</span>')
+                    ui.html('<span class="pill good"><span style="width:7px;height:7px;border-radius:50%;background:#34d399;box-shadow:0 0 10px #34d399"></span>live</span>')
                     ui.label(str(Path(arena).expanduser().resolve())).classes("mono tiny")
             dashboard()
 
@@ -627,69 +681,55 @@ def run_dashboard(arena: str | Path, *, host: str = "127.0.0.1", port: int = 808
 
         render_top_stats(snapshot)
 
+        with ui.card().classes("glass w-full rounded-[28px] p-4"):
+            render_leaderboard(snapshot)
+
         with ui.grid(columns=12).classes("w-full gap-5"):
             with ui.card().classes("glass col-span-12 xl:col-span-8 rounded-[28px] p-4"):
                 with ui.row().classes("w-full justify-between items-center mb-2"):
                     with ui.column().classes("gap-0"):
                         ui.label("branch constellation").classes("text-lg font-bold")
-                        ui.label("new children appear as glowing nodes; Pareto nodes get a green orbit").classes("tiny")
-                    ui.select(
-                        options=[r.run_id for r in reversed(snapshot.runs[-40:])],
-                        value=selected_id,
-                        label="inspect run",
-                        on_change=lambda e: set_selected(e.value),
-                    ).props("dense outlined dark").classes("w-56")
+                        ui.label("click a node to inspect it; latest node breathes").classes("tiny")
+                    ui.html(f'<span class="pill mono">selected {html.escape(str(selected_id or "—"))}</span>')
                 ui.html(render_branch_svg(snapshot, selected_id)).classes("w-full")
 
-            with ui.card().classes("glass col-span-12 xl:col-span-4 rounded-[28px] p-5"):
-                render_decision_panel(selected)
+            with ui.column().classes("col-span-12 xl:col-span-4 gap-5"):
+                with ui.card().classes("glass rounded-[28px] p-4"):
+                    with ui.row().classes("w-full justify-between items-center mb-2"):
+                        ui.label("score skyline").classes("text-lg font-bold")
+                        ui.html(f'<span class="pill">rev {snapshot.revision}</span>')
+                    ui.html(render_score_svg(snapshot.runs)).classes("w-full")
+                with ui.card().classes("glass rounded-[28px] p-4"):
+                    render_metric_strip(selected)
 
-        with ui.grid(columns=12).classes("w-full gap-5"):
-            with ui.card().classes("glass col-span-12 lg:col-span-7 rounded-[28px] p-4"):
-                with ui.row().classes("w-full justify-between items-center mb-2"):
-                    ui.label("score skyline").classes("text-lg font-bold")
-                    ui.html(f'<span class="pill">rev {snapshot.revision} · refreshed {_ago(state["last_changed"])} ago</span>')
-                ui.html(render_score_svg(snapshot.runs)).classes("w-full")
-
-            with ui.card().classes("glass col-span-12 lg:col-span-5 rounded-[28px] p-4"):
-                render_metric_strip(selected)
-
-        with ui.grid(columns=12).classes("w-full gap-5"):
-            with ui.card().classes("glass col-span-12 xl:col-span-7 rounded-[28px] p-4"):
-                render_leaderboard(snapshot)
-            with ui.card().classes("glass col-span-12 xl:col-span-5 rounded-[28px] p-4"):
-                render_queue(snapshot)
-
-        with ui.grid(columns=12).classes("w-full gap-5"):
-            with ui.card().classes("glass col-span-12 xl:col-span-6 rounded-[28px] p-4"):
-                render_actions(snapshot)
-            with ui.card().classes("glass col-span-12 xl:col-span-6 rounded-[28px] p-4"):
-                render_run_detail(selected)
+        with ui.card().classes("glass w-full rounded-[28px] p-5"):
+            render_decision_panel(selected)
 
     def render_top_stats(snapshot: ArenaSnapshot) -> None:
         runs = snapshot.runs
         succeeded = sum(1 for r in runs if r.status == "succeeded")
         failed = sum(1 for r in runs if r.status == "failed")
         queued = sum(1 for q in snapshot.queue if q.get("status") == "queued")
-        running = sum(1 for q in snapshot.queue if q.get("status") == "running") + sum(1 for r in runs if r.status in {"created", "running", "unknown"})
         best = snapshot.best_run
         latest = snapshot.latest_run
-        stats = [
-            ("runs", len(runs), "registered branches", "good"),
-            ("best score", _fmt(best.score if best else None), best.run_id if best else "no score yet", "good"),
-            ("queue", queued, f"{running} running · {len(snapshot.queue)} total", "warn"),
-            ("failed", failed, f"{succeeded} succeeded", "bad" if failed else "good"),
-            ("latest", _short_run(latest.run_id) if latest else "—", latest.status if latest else "waiting", "good"),
+        ribbon = [
+            ("runs", len(runs), "good"),
+            ("best", _fmt(best.score if best else None), "good"),
+            ("latest", _short_run(latest.run_id) if latest else "—", "good"),
+            ("queue", queued, "warn"),
+            ("ok/fail", f"{succeeded}/{failed}", "bad" if failed else "good"),
+            ("refresh", f"{_ago(state['last_changed'])}", ""),
         ]
-        with ui.grid(columns=5).classes("w-full gap-4"):
-            for label, value, sub, tone in stats:
-                with ui.card().classes("stat-card col-span-5 sm:col-span-1"):
-                    ui.label(str(value)).classes("stat-value neon mono" if label in {"best score", "latest"} else "stat-value mono")
-                    ui.label(label).classes("stat-label")
-                    ui.html(f'<span class="pill {tone}">{html.escape(str(sub))}</span>')
+        html_bits = []
+        for label, value, tone in ribbon:
+            html_bits.append(f'<span class="pill {tone}"><span class="mono">{html.escape(str(value))}</span> {html.escape(label)}</span>')
+        ui.html('<div class="glass ribbon" style="border-radius:22px;padding:14px 16px;display:flex;gap:12px;flex-wrap:wrap;align-items:center">' + ''.join(html_bits) + '</div>').classes("w-full")
 
     def render_decision_panel(run: RunView | None) -> None:
-        ui.label("decision cockpit").classes("text-lg font-bold")
+        with ui.row().classes("w-full justify-between items-center mb-3"):
+            ui.label("decision cockpit").classes("text-lg font-bold")
+            if run:
+                ui.html(f'<span class="pill mono">{html.escape(run.run_id)} · {html.escape(run.status)} · gen {run.generation}</span>')
         if not run:
             ui.label("No run selected.").classes("tiny")
             return
@@ -698,22 +738,21 @@ def run_dashboard(arena: str | Path, *, host: str = "127.0.0.1", port: int = 808
         confidence = review.get("confidence")
         improvement = review.get("is_improvement")
         tone = "good" if recommendation in {"continue", "exploit", "retry"} or improvement is True else "warn" if run.status != "failed" else "bad"
-        ui.html(f'<div class="pill {tone} mono">{html.escape(str(recommendation))} · confidence {_fmt(confidence)}</div>').classes("my-2")
-        with ui.column().classes("gap-3 mt-3"):
-            _mini_block("run", f"{run.run_id} · {run.status} · gen {run.generation}")
+        ui.html(f'<div class="pill {tone} mono">{html.escape(str(recommendation))} · confidence {_fmt(confidence)}</div>').classes("mb-3")
+        with ui.column().classes("gap-3 max-h-[430px] overflow-y-auto pr-2"):
             _mini_block("mutation", str(run.data.get("mutation_summary") or run.data.get("mutation_type") or "—"))
-            _mini_block("observation", str(review.get("observation") or run.data.get("observation") or "No review observation yet."), clamp=True)
-            _mini_block("next belief", str(review.get("next_belief") or run.data.get("next_belief") or "No next belief yet."), clamp=True)
-        recs = _as_list(review.get("recommended_next_mutations"))[:3]
-        if recs:
-            ui.label("recommended branches").classes("mt-4 text-sm font-bold text-slate-200")
-            for rec in recs:
-                ui.html(
-                    '<div class="mt-2 p-3 rounded-xl" style="background:rgba(2,6,23,.34);border:1px solid rgba(148,163,184,.10)">'
-                    f'<div class="pill warn mono">p={html.escape(_fmt(rec.get("priority")))} · {html.escape(str(rec.get("mutation_type") or "mutation"))}</div>'
-                    f'<div class="tiny mt-2" style="color:#cbd5e1">{html.escape(str(rec.get("description") or rec.get("proposed_mutation") or ""))}</div>'
-                    '</div>'
-                )
+            _mini_block("observation", str(review.get("observation") or run.data.get("observation") or "No review observation yet."))
+            _mini_block("next belief", str(review.get("next_belief") or run.data.get("next_belief") or "No next belief yet."))
+            recs = _as_list(review.get("recommended_next_mutations"))[:4]
+            if recs:
+                ui.label("recommended branches").classes("text-sm font-bold text-slate-100")
+                for rec in recs:
+                    ui.html(
+                        '<div class="p-3 rounded-xl" style="background:rgba(15,23,42,.28);border:1px solid rgba(203,213,225,.12)">'
+                        f'<div class="pill warn mono">p={html.escape(_fmt(rec.get("priority")))} · {html.escape(str(rec.get("mutation_type") or "mutation"))}</div>'
+                        f'<div class="tiny mt-2" style="color:#e5edf7;line-height:1.42">{html.escape(str(rec.get("description") or rec.get("proposed_mutation") or ""))}</div>'
+                        '</div>'
+                    )
 
     def render_metric_strip(run: RunView | None) -> None:
         ui.label("selected branch metrics").classes("text-lg font-bold mb-2")
@@ -732,7 +771,7 @@ def run_dashboard(arena: str | Path, *, host: str = "127.0.0.1", port: int = 808
         ]
         with ui.grid(columns=4).classes("w-full gap-3"):
             for label, value in metrics:
-                with ui.column().classes("gap-0 p-3 rounded-2xl").style("background:rgba(2,6,23,.34);border:1px solid rgba(148,163,184,.10)"):
+                with ui.column().classes("gap-0 p-3 rounded-2xl").style("background:rgba(15,23,42,.28);border:1px solid rgba(203,213,225,.12)"):
                     ui.label(_fmt(value)).classes("mono text-xl font-black text-cyan-100")
                     ui.label(label).classes("tiny uppercase tracking-widest")
 
@@ -749,7 +788,7 @@ def run_dashboard(arena: str | Path, *, host: str = "127.0.0.1", port: int = 808
                     "score": _fmt(run.score),
                     "acc": _fmt(run.data.get("val_accuracy")),
                     "params": _compact(run.data.get("parameter_count")),
-                    "ms": _fmt(run.data.get("latency_ms")),
+                    "train_sec": _fmt(run.data.get("train_seconds")),
                     "pareto": "✦" if run.run_id in pareto else "",
                     "idea": _clip(str(run.data.get("mutation_summary") or run.data.get("mutation_type") or ""), 64),
                 }
@@ -764,7 +803,7 @@ def run_dashboard(arena: str | Path, *, host: str = "127.0.0.1", port: int = 808
                 {"name": "score", "label": "score", "field": "score", "align": "right"},
                 {"name": "acc", "label": "acc", "field": "acc", "align": "right"},
                 {"name": "params", "label": "params", "field": "params", "align": "right"},
-                {"name": "ms", "label": "ms", "field": "ms", "align": "right"},
+                {"name": "train_sec", "label": "train_sec", "field": "train_sec", "align": "right"},
                 {"name": "pareto", "label": "P", "field": "pareto", "align": "center"},
                 {"name": "idea", "label": "idea", "field": "idea", "align": "left"},
             ],
@@ -841,9 +880,9 @@ def run_dashboard(arena: str | Path, *, host: str = "127.0.0.1", port: int = 808
         safe_value = html.escape(value or "—")
         max_height = "max-height:7.5rem;overflow:hidden" if clamp else ""
         ui.html(
-            f'<div class="p-3 rounded-2xl" style="background:rgba(2,6,23,.34);border:1px solid rgba(148,163,184,.10)">'
+            f'<div class="p-3 rounded-2xl" style="background:rgba(15,23,42,.28);border:1px solid rgba(203,213,225,.12)">'
             f'<div class="tiny uppercase tracking-widest">{html.escape(label)}</div>'
-            f'<div style="color:#e2e8f0;line-height:1.38;font-size:.88rem;{max_height}">{safe_value}</div>'
+            f'<div style="color:#eef6ff;line-height:1.42;font-size:.9rem;{max_height}">{safe_value}</div>'
             '</div>'
         )
 
@@ -1019,7 +1058,7 @@ def main() -> None:
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8080)
     parser.add_argument("--poll-s", type=float, default=1.0, help="filesystem polling interval")
-    parser.add_argument("--title", default="AI Evolver Live")
+    parser.add_argument("--title", default="AI Evolver // live arena")
     args = parser.parse_args()
     run_dashboard(args.arena, host=args.host, port=args.port, poll_s=args.poll_s, title=args.title)
 
