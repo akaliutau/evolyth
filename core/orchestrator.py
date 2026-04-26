@@ -60,6 +60,25 @@ def _patch_json_object(path: Path, updates: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(data, indent=2, sort_keys=True, default=str), encoding="utf-8")
 
+def _fallback_review(exc: Exception) -> dict[str, Any]:
+    """Non-fatal review used when the reviewer/LLM crashes or times out.
+
+    The training run has already completed by this point. Review failure should
+    not prevent registration of the run, artifact persistence, or completion of
+    the consumed queue item.
+    """
+    return {
+        "valid": None,
+        "is_improvement": None,
+        "branch_recommendation": "na",
+        "confidence": 0.0,
+        "observation": f"Review unavailable: {type(exc).__name__}: {exc}",
+        "next_belief": "No reviewer conclusion was available for this run.",
+        "recommended_next_mutations": [],
+        "review_status": "failed",
+        "review_error_type": type(exc).__name__,
+        "review_error": str(exc)[-4000:],
+    }
 
 class EvolutionOrchestrator:
     """Small autonomous loop: select → mutate → execute → review → queue."""
@@ -132,7 +151,11 @@ class EvolutionOrchestrator:
             )
 
             child_dict = record.to_dict()
-            review = await self.reviewer.review(parent, child_dict, context)
+            try:
+                review = await self.reviewer.review(parent, child_dict, context)
+            except Exception as exc:
+                review = _fallback_review(exc)
+
             evolution_time_seconds = round(time.monotonic() - evolution_started, 3)
             record.observation = str(review.get("observation") or record.observation or "")
             record.next_belief = str(review.get("next_belief") or record.next_belief or "")
