@@ -209,7 +209,21 @@ def env_get(spec: dict[str, Any], key: str, env_key: str | None = None, default:
 def safe_name(raw: str, max_len: int = 63) -> str:
     value = re.sub(r"[^a-z0-9-]+", "-", raw.lower()).strip("-")
     value = re.sub(r"-+", "-", value) or "acr-job"
+    if value[0].isdigit():
+        value = f"acr-{value}"
     return value[:max_len].strip("-") or "acr-job"
+
+
+def unique_cloud_job_name(name: str, run_id: str) -> tuple[str, str]:
+    """Cloud Run Job name for one orchestration attempt.
+
+    The evolver run_id remains stable for artifacts and lineage. The Cloud Run
+    Job resource gets an extra per-attempt suffix so stale jobs from killed or
+    partially failed orchestrations cannot collide with a retry of the same run.
+    """
+    attempt_id = uuid.uuid4().hex[:8]
+    prefix = safe_name(f"{name}-{run_id}", max_len=63 - 1 - len(attempt_id))
+    return safe_name(f"{prefix}-{attempt_id}", max_len=63), attempt_id
 
 
 def parse_key_value(items: Iterable[str]) -> dict[str, str]:
@@ -685,7 +699,7 @@ def main() -> int:
     run_id = args.run_id.strip() if args.run_id else f"{datetime.now(timezone.utc).strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:8]}"
     if not re.match(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$", run_id):
         raise RunnerError("run-id must be 1-128 chars and contain only letters, digits, dot, underscore, or dash", 64)
-    job_name = safe_name(f"{name}-{run_id}", max_len=63)
+    job_name, job_attempt_id = unique_cloud_job_name(name, run_id)
     runner_image = resolve_runner_image(spec, project_id, region, repo, default_name=name)
     source_prefix = str((spec.get("source") or {}).get("gcs_prefix") or f"gs://{bucket}/acr-sources/{name}").rstrip("/")
     source_gcs_uri = f"{source_prefix}/{run_id}/source.tar.gz"
@@ -736,7 +750,7 @@ def main() -> int:
             "DATASET_DIR": dataset["container_dir"],
         })
 
-    emit("run_resolved", run_id=run_id, job_name=job_name, image_uri=runner_image, source_gcs_uri=source_gcs_uri, output_gcs_uri=output_gcs_uri, local_output_dir=str(local_output_dir))
+    emit("run_resolved", run_id=run_id, job_name=job_name, job_attempt_id=job_attempt_id, image_uri=runner_image, source_gcs_uri=source_gcs_uri, output_gcs_uri=output_gcs_uri, local_output_dir=str(local_output_dir))
 
     selected, manifest = collect_files(app_dir, spec)
     tmp_dir = pathlib.Path(tempfile.mkdtemp(prefix="acr-source-"))
@@ -744,6 +758,7 @@ def main() -> int:
     summary: dict[str, Any] = {
         "run_id": run_id,
         "job_name": job_name,
+        "job_attempt_id": job_attempt_id,
         "execution_name": None,
         "image_uri": runner_image,
         "source_gcs_uri": source_gcs_uri,

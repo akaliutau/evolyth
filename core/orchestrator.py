@@ -68,69 +68,75 @@ class EvolutionOrchestrator:
     async def evolve_one(self) -> EvolutionStepResult:
         run_id = next_run_id(self.config.arena_root)
         assignment = self._next_assignment()
-        parent = assignment.get("parent")
-        parent_id = parent.get("run_id") if parent else None
-        generation = int(parent.get("generation") or 0) + 1 if parent else 0
-        parent_model = parent.get("model_path") if parent else None
+        queue_item_id = str(assignment.get("queue_item_id") or "")
+        try:
+            parent = assignment.get("parent")
+            parent_id = parent.get("run_id") if parent else None
+            generation = int(parent.get("generation") or 0) + 1 if parent else 0
+            parent_model = parent.get("model_path") if parent else None
 
-        workspace_rp = create_workspace(
-            arena_root=self.config.arena_root,
-            source_rp=self.config.rp,
-            run_id=run_id,
-            parent_model_path=parent_model,
-        )
-        before = snapshot_hashes(workspace_rp.path)
-
-        context = self._context(workspace_rp, parent_id, assignment)
-        context_path = Path(self.config.arena_root) / "runs" / run_id / "context.md"
-        context_path.parent.mkdir(parents=True, exist_ok=True)
-        context_path.write_text(context, encoding="utf-8")
-
-        mutation = await self.agent.mutate(workspace_rp, context)
-        changed = []
-        if self.config.validate_single_file:
-            changed = validate_only_allowed_changed(before, workspace_rp.path, {workspace_rp.mutable_file})
-
-        mutation = self._merge_mutation_defaults(mutation, assignment, changed)
-
-        record = await self.executor.execute(
-            RunSpec(
-                rp=workspace_rp,
+            workspace_rp = create_workspace(
+                arena_root=self.config.arena_root,
+                source_rp=self.config.rp,
                 run_id=run_id,
-                parent_id=parent_id,
-                generation=generation,
-                smoke=self.config.smoke,
-                extra_args=self.config.extra_args,
-                mutation_type=mutation.mutation_type,
-                mutation_summary=mutation.mutation_summary,
-                hypothesis=mutation.hypothesis,
+                parent_model_path=parent_model,
             )
-        )
+            before = snapshot_hashes(workspace_rp.path)
 
-        child_dict = record.to_dict()
-        review = await self.reviewer.review(parent, child_dict, context)
-        record.observation = str(review.get("observation") or record.observation or "")
-        record.next_belief = str(review.get("next_belief") or record.next_belief or "")
+            context = self._context(workspace_rp, parent_id, assignment)
+            context_path = Path(self.config.arena_root) / "runs" / run_id / "context.md"
+            context_path.parent.mkdir(parents=True, exist_ok=True)
+            context_path.write_text(context, encoding="utf-8")
 
-        run_dir = Path(record.artifact_path)
-        run_dir.mkdir(parents=True, exist_ok=True)
-        (run_dir / "context.md").write_text(context, encoding="utf-8")
-        (run_dir / "mutation.json").write_text(json.dumps(mutation.__dict__, indent=2, sort_keys=True), encoding="utf-8")
-        (run_dir / "ds_review.json").write_text(json.dumps(review, indent=2, sort_keys=True, default=str), encoding="utf-8")
+            mutation = await self.agent.mutate(workspace_rp, context)
+            changed = []
+            if self.config.validate_single_file:
+                changed = validate_only_allowed_changed(before, workspace_rp.path, {workspace_rp.mutable_file})
 
-        registered = self.store.register(record)
-        queued = self._enqueue_next(record.run_id, review)
+            mutation = self._merge_mutation_defaults(mutation, assignment, changed)
 
-        if assignment.get("queue_item_id"):
-            self.queue.complete(str(assignment["queue_item_id"]))
+            record = await self.executor.execute(
+                RunSpec(
+                    rp=workspace_rp,
+                    run_id=run_id,
+                    parent_id=parent_id,
+                    generation=generation,
+                    smoke=self.config.smoke,
+                    extra_args=self.config.extra_args,
+                    mutation_type=mutation.mutation_type,
+                    mutation_summary=mutation.mutation_summary,
+                    hypothesis=mutation.hypothesis,
+                )
+            )
 
-        return EvolutionStepResult(
-            run=registered,
-            review=review,
-            queued=queued,
-            context_path=str(context_path),
-            workspace_path=str(workspace_rp.path),
-        )
+            child_dict = record.to_dict()
+            review = await self.reviewer.review(parent, child_dict, context)
+            record.observation = str(review.get("observation") or record.observation or "")
+            record.next_belief = str(review.get("next_belief") or record.next_belief or "")
+
+            run_dir = Path(record.artifact_path)
+            run_dir.mkdir(parents=True, exist_ok=True)
+            (run_dir / "context.md").write_text(context, encoding="utf-8")
+            (run_dir / "mutation.json").write_text(json.dumps(mutation.__dict__, indent=2, sort_keys=True), encoding="utf-8")
+            (run_dir / "ds_review.json").write_text(json.dumps(review, indent=2, sort_keys=True, default=str), encoding="utf-8")
+
+            registered = self.store.register(record)
+            queued = self._enqueue_next(record.run_id, review)
+
+            if queue_item_id:
+                self.queue.complete(queue_item_id)
+
+            return EvolutionStepResult(
+                run=registered,
+                review=review,
+                queued=queued,
+                context_path=str(context_path),
+                workspace_path=str(workspace_rp.path),
+            )
+        except BaseException:
+            if queue_item_id:
+                self.queue.fail(queue_item_id)
+            raise
 
     def _next_assignment(self) -> dict[str, Any]:
         if self.config.use_queue:
@@ -195,6 +201,6 @@ Return structured mutation metadata after editing `{workspace_rp.mutable_file}`.
                 proposed_mutation=str(rec.get("description") or rec.get("proposed_mutation") or "Make one bounded mutation."),
                 priority=float(rec.get("priority") or 0.5),
             )
-            self.queue.enqueue(item)
-            queued.append(item.__dict__)
+            if self.queue.enqueue(item):
+                queued.append(item.__dict__)
         return queued
