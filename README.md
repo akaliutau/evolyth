@@ -145,23 +145,13 @@ conda activate evolyth
 pip install -r requirements.txt
 ```
 
-Optional dashboard dependency:
-
-```bash
-pip install nicegui
-```
-
 ### 2. Configure Claude Code, if using Claude workers
 
 ```bash
 curl -fsSL https://claude.ai/install.sh | bash
 ```
 
-Then configure key with either a `.env` file or the Claude CLI:
-
-```bash
-claude config set apiKey "sk-ant-..."
-```
+Then configure API key with a `.env` file
 
 You can also run the loop without Claude using the no-op or heuristic modes shown below.
 
