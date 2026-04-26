@@ -3,7 +3,7 @@ import os
 import pathlib
 import time
 
-artifact_dir = pathlib.Path(os.environ.get("ACR_ARTIFACT_DIR", "./artifacts"))
+artifact_dir = pathlib.Path(os.environ.get("ACR_ARTIFACT_DIR", "artifacts"))
 artifact_dir.mkdir(parents=True, exist_ok=True)
 
 # Example: consume env vars passed by --env from the parent pipeline.
