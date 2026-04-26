@@ -109,7 +109,71 @@ The loop is deliberately conservative. Evolyth is not trying to let an agent rew
 
 ---
 
-## What Evolyth offers
+## Tiny-CIFAR experiment evidence
+
+Evolyth has been exercised on the [`tiny-cifar`](https://github.com/akaliutau/tiny-cifar.git) research problem as a compact proof of the full autonomous loop: propose a bounded architecture mutation, execute it, extract comparable metrics, review the evidence, and queue the next move.
+
+This is not presented as a full CIFAR-10 benchmark claim. It is an **arena evidence pack**: 16 registered runs with lineage, metrics, mutation summaries, reviewer observations, and next beliefs preserved as JSONL artifacts.
+
+### Result snapshot
+
+Across the recorded tiny-cifar run history, Evolyth moved from the original tiny depthwise-residual CNN baseline to a clean 6-layer ConvMixer-style incumbent. The best-score candidate improved the multi-objective score by **20.3%**, improved validation accuracy by **4.2 percentage points**, reduced parameter count by **47.1%**, and reduced serialized model size by **44.2%** versus the baseline.
+
+| Role                     | Run        |   Score | Val acc   | Params   |   Model KB |   Latency ms |   Train s |
+|:-------------------------|:-----------|--------:|:----------|:---------|-----------:|-------------:|----------:|
+| Baseline                 | run_000001 |  0.2391 | 37.5%     | 92,194   |      398.2 |        11.69 |      18.9 |
+| Best score               | run_000014 |  0.2876 | 41.7%     | 48,778   |      222.2 |        12.88 |      51.1 |
+| Lowest latency           | run_000003 |  0.2534 | 37.8%     | 31,978   |      154.9 |        10.06 |      34.4 |
+| Latency-optimised branch | run_000015 |  0.2827 | 41.2%     | 48,778   |      222.9 |        12.2  |      33   |
+
+### What the search learned
+
+- **The winning branch was not bigger.** The best-score model used 48,778 parameters versus 92,194 in the baseline.
+- **The strongest repeated incumbent was a clean ConvMixer variant.** Runs `run_000008`, `run_000012`, and `run_000014` all recovered the same 41.7% validation accuracy pattern after reverting failed branches.
+- **Negative evidence was preserved rather than hidden.** Attention gates, extra depth, wider kernels, DropPath, and lower dropout all regressed under the short training budget.
+- **Pareto tracking matters.** The top score is not the only useful candidate; the low-latency and latency-optimised branches remain valuable for deployment-oriented follow-up.
+
+| Front                   | Runs                                           |
+|:------------------------|:-----------------------------------------------|
+| Accuracy/params         | run_000003, run_000008, run_000012, run_000014 |
+| Accuracy/params/latency | run_000003, run_000016, run_000015, run_000014 |
+
+### Charts
+
+<p align="center">
+  <img src="docs/score_trajectory.png" alt="Tiny-CIFAR score trajectory" width="760">
+</p>
+
+<p align="center">
+  <img src="docs/mutation_type_score_impact.png" alt="Tiny-CIFAR mutation type impact" width="760">
+</p>
+
+### Failed hypotheses are part of the contribution
+
+| Rejected hypothesis              | Run        | Evidence                                |
+|:---------------------------------|:-----------|:----------------------------------------|
+| SE in original DWBlocks          | run_000002 | -1.7 pp accuracy, -7.9% score vs parent |
+| 8-layer ConvMixer depth increase | run_000005 | -1.4 pp accuracy, -6.5% score vs parent |
+| SE in ConvMixer layers           | run_000013 | -2.9 pp accuracy vs parent              |
+| DropPath regularization          | run_000011 | -2.3 pp accuracy vs parent              |
+| Lower dropout 0.2→0.1            | run_000016 | -2.9 pp accuracy vs parent              |
+
+These failures make the result more credible: Evolyth is not just generating code, it is maintaining a falsifiable experiment trail. The arena records which ideas did not work under the current budget and why they should be avoided or revisited under different conditions.
+
+### Current caveats and hardening items
+
+- The tiny-cifar evidence uses a short training budget, so the next validation step should rerun the baseline and incumbent across multiple seeds.
+- All registered full runs succeeded, but `dry_run_passed=false` appears across the log. That likely points to a smoke-test harness edge case and should be fixed before making reliability claims from dry-run status.
+- The best candidates should be promoted to a stricter comparison: fixed seeds, longer training, held-out test evaluation, and explicit compute/LLM cost accounting.
+
+### Why this increases Evolyth's potential
+
+The tiny-cifar run demonstrates the system-level promise of Evolyth: it can preserve an auditable research loop, recover from poor mutations, identify efficient candidates, and turn model-search history into reusable scientific evidence. That is the practical difference between an AI coding agent that writes one model and an autonomous R&D arena that improves, remembers, and explains a sequence of experiments.
+
+
+---
+
+## Our advantages
 
 ### Autonomous model R&D
 
