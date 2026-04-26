@@ -47,7 +47,7 @@ class ClaudeCodeReviewer(Reviewer):
     can consume.
     """
 
-    def __init__(self, executable: str = "claude", max_turns: int = 4, timeout_s: int | None = None):
+    def __init__(self, executable: str = "claude", max_turns: int = 8, timeout_s: int | None = None):
         self.executable = executable
         self.max_turns = max_turns
         self.timeout_s = timeout_s if timeout_s is not None else _env_int("EVOLVER_CLAUDE_REVIEW_TIMEOUT_S", 300)

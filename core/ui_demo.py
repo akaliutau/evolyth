@@ -674,7 +674,7 @@ def run_dashboard(arena: str | Path, *, host: str = "127.0.0.1", port: int = 808
         ui.timer(poll_s, tick)
         with ui.column().classes("evo-page w-full gap-4 px-5 py-5 md:px-8 md:py-7"):
             with ui.row().classes("w-full items-center justify-between gap-4"):
-                ui.label("AI Evolver // live arena").classes("text-3xl md:text-5xl font-black neon tracking-tight")
+                ui.label("Evolyth // live arena").classes("text-3xl md:text-5xl font-black neon tracking-tight")
                 with ui.row().classes("items-center gap-2"):
                     ui.html('<span class="pill good"><span style="width:7px;height:7px;border-radius:50%;background:#34d399;box-shadow:0 0 10px #34d399"></span>live</span>')
                     ui.label(str(Path(arena).expanduser().resolve())).classes("mono tiny")
@@ -698,7 +698,7 @@ def run_dashboard(arena: str | Path, *, host: str = "127.0.0.1", port: int = 808
             with ui.card().classes("glass col-span-12 xl:col-span-8 rounded-[28px] p-4"):
                 with ui.row().classes("w-full justify-between items-center mb-2"):
                     with ui.column().classes("gap-0"):
-                        ui.label("branch constellation").classes("text-lg font-bold")
+                        ui.label("evolution tree").classes("text-lg font-bold")
                         ui.label("click a node to inspect it; latest node breathes").classes("tiny")
                     ui.html(f'<span class="pill mono">selected {html.escape(str(selected_id or "—"))}</span>')
                 ui.html(render_branch_svg(snapshot, selected_id)).classes("w-full")
@@ -898,7 +898,7 @@ def run_dashboard(arena: str | Path, *, host: str = "127.0.0.1", port: int = 808
             '</div>'
         )
 
-    ui.run(host=host, port=port, title=title, favicon="🧬", reload=False, show=False)
+    ui.run(host=host, port=port, title=title, favicon="🧬", reload=False, show=True)
 
 
 # -----------------------------------------------------------------------------
@@ -1070,7 +1070,7 @@ def main() -> None:
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8080)
     parser.add_argument("--poll-s", type=float, default=1.0, help="filesystem polling interval")
-    parser.add_argument("--title", default="AI Evolver // live arena")
+    parser.add_argument("--title", default="Evolyth // live arena")
     args = parser.parse_args()
     run_dashboard(args.arena, host=args.host, port=args.port, poll_s=args.poll_s, title=args.title)
 
