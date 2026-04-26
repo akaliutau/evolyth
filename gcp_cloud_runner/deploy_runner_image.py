@@ -163,7 +163,7 @@ def main() -> int:
             shutil.copy2(requirements, build_dir / req_name)
         dockerfile = [
             f"FROM {base_image}",
-            "ENV PYTHONUNBUFFERED=1 PIP_NO_CACHE_DIR=1 ACR_WORKDIR=/workspace/app ACR_ARTIFACT_DIR=/workspace/artifacts",
+            "ENV PYTHONUNBUFFERED=1 PIP_NO_CACHE_DIR=1 PIP_BREAK_SYSTEM_PACKAGES=1 ACR_WORKDIR=/workspace/app ACR_ARTIFACT_DIR=/workspace/artifacts",
             "WORKDIR /workspace",
         ]
         if apt_packages:

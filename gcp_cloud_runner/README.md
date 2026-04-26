@@ -59,7 +59,7 @@ Build this only when the base image or Python dependencies change:
 ```bash
 ./deploy_runner_image.sh \
   --spec /path/to/cloud_runner.yaml \
-  --requirements /path/to/external-training-repo/requirements.txt
+  --requirements requirements.txt
 ```
 
 You can also pass everything explicitly:
@@ -71,7 +71,7 @@ You can also pass everything explicitly:
   --artifact-repo "$AR_REPO" \
   --image-name acr-torch-runner \
   --image-tag latest \
-  --base-image pytorch/pytorch:2.3.1-cuda12.1-cudnn8-runtime \
+  --base-image pytorch/pytorch:2.11.0-cuda13.0-cudnn9-runtime \
   --requirements /repos/trainer/requirements.txt \
   --keep-images 2
 ```
@@ -150,13 +150,19 @@ If dataset download fails with a 403 mentioning billing, the runner cannot fix i
 
 ## Run once from a parent pipeline
 
+Upload dataset if needed: 
+
 ```bash
-python application_cloud_runner.py \
-  --app-dir /repos/external-training-project \
-  --spec /pipeline/cloud_runner.yaml \
-  --local-output-dir /pipeline/artifacts/run-001 \
-  --dataset gs://my-bucket/datasets/v1 \
-  --env EPOCHS=3 \
+gcloud storage cp cifar-10-batches-py.tar.gz \
+  gs://evo-training-data/datasets/tiny-cifar10/cifar-10-batches-py.tar.gz
+```
+
+```bash
+python gcp_cloud_runner/application_cloud_runner.py   \
+  --app-dir /media/DATA/repos-work/tiny-cifar   \
+  --spec  /media/DATA/repos-work/tiny-cifar/cloud_runner.yaml   \
+  --local-output-dir ./artifacts/run-001   \
+  --env EPOCHS=3   \
   --env LR=0.0003
 ```
 

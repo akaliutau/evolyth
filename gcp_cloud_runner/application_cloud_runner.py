@@ -692,6 +692,7 @@ def main() -> int:
     command = resolve_command(spec)
     cloud = validate_cloud_run_shape(spec)
     dataset = resolve_dataset(spec, args.dataset)
+    print(dataset)
     task_timeout_seconds = timeout_to_seconds(cloud["task_timeout"])
     orchestration_timeout = args.timeout_seconds or (task_timeout_seconds + 900)
     if args.poll_interval_seconds < 2:
