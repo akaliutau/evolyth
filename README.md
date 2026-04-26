@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="docs/main_screeen.png" alt="Evolyth" width="680">
+  <img src="docs/main_screen.png" alt="Evolyth" width="680">
 </p>
 
 <h1 align="center">Evolyth</h1>
@@ -20,7 +20,7 @@
 
 
 <p align="center">
-  Evolyth turns a machine-learning research problem into evolutionary loop:
+  Evolyth turns a machine-learning research problem into an evolutionary loop:
   propose a mutation, run the experiment, review the result, preserve the evidence, and queue the next best move.
 </p>
 
@@ -57,11 +57,11 @@ A human writes a Research Problem (RP): the goal, the training/evaluation script
 
 The key design decision is that the AI agent is **not the system of record**. The arena is. Agents are replaceable workers. The arena keeps the history, leaderboard, Pareto front, queue, lineage, and artifacts.
 
-That makes Evolyth closer to a small autonomous lab notebook than to a one-shot code generator.
+That makes Evolyth closer to a small autonomous lab than to a one-shot code generator.
 
 ---
 
-## Diagram 1 — System architecture
+## System Architecture
 
 <p align="center">
   <img src="docs/evolyth_diag_1_sm.jpg" alt="Evolyth system architecture" width="800">
@@ -80,7 +80,7 @@ This separation is the reason the loop stays debuggable. A failed reviewer does 
 
 ---
 
-## Diagram 2 — Evolution loop
+## Evolution loop
 
 <p align="center">
   <img src="docs/evolyth_diag_2_sm.jpg" alt="Evolyth system architecture" width="700">
@@ -637,10 +637,9 @@ Before opening a large PR, start with an issue describing the research workflow 
 
 ## ⚖️ License
 
-Project Aethelgard is open-source software distributed under the **MIT License**. 
+Evolyth is open-source software distributed under the **MIT License**. 
 
-By keeping the core routing and security protocol open and accessible, we aim to lower the barrier to entry for underfunded 
-rural clinics and state-scale hospital networks alike. See the [LICENSE](LICENSE) file for more details.
+See the [LICENSE](LICENSE) file for more details.
 
 ---
 
