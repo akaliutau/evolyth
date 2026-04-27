@@ -160,12 +160,6 @@ Across the recorded tiny-cifar run history, Evolyth moved from the original tiny
 
 These failures make the result more credible: Evolyth is not just generating code, it is maintaining a falsifiable experiment trail. The arena records which ideas did not work under the current budget and why they should be avoided or revisited under different conditions.
 
-### Current caveats and hardening items
-
-- The tiny-cifar evidence uses a short training budget, so the next validation step should rerun the baseline and incumbent across multiple seeds.
-- All registered full runs succeeded, but `dry_run_passed=false` appears across the log. That likely points to a smoke-test harness edge case and should be fixed before making reliability claims from dry-run status.
-- The best candidates should be promoted to a stricter comparison: fixed seeds, longer training, held-out test evaluation, and explicit compute/LLM cost accounting.
-
 ### Why this increases Evolyth's potential
 
 The tiny-cifar run demonstrates the system-level promise of Evolyth: it can preserve an auditable research loop, recover from poor mutations, identify efficient candidates, and turn model-search history into reusable scientific evidence. That is the practical difference between an AI coding agent that writes one model and an autonomous R&D arena that improves, remembers, and explains a sequence of experiments.
@@ -201,6 +195,8 @@ Use the NiceGUI dashboard to watch the arena evolve, or query the small API for 
 ---
 
 ## [Quickstart](#quickstart)
+
+The full setup will require a GCP account, details are [here](gcp_cloud_runner/README_GCP.md)
 
 ### 1. Clone and install
 
