@@ -27,7 +27,7 @@
 <p align="center">
   <a href="#quickstart">Quickstart</a> ·
   <a href="#why-evolyth-exists">Why</a> ·
-  <a href="#how-it-works">How it works</a> ·
+  <a href="#system-architecture">How it works</a> ·
   <a href="#research-problem-contract">RP contract</a> ·
   <a href="#cloud-gpu-execution">Cloud GPU</a> ·
   <a href="#live-dashboard">Dashboard</a>
@@ -63,7 +63,7 @@ Specifically for demo we have created a test project [tiny-cifar](https://github
 
 ---
 
-## System Architecture
+## [System Architecture](#system-architecture)
 
 <p align="center">
   <img src="docs/evolyth_diag_1_sm.jpg" alt="Evolyth system architecture" width="800">
@@ -336,7 +336,7 @@ This artifact-first contract is what lets Evolyth recover from partial failures 
 
 ---
 
-## [Autonomous loop in detail](#how-it-works)
+## Autonomous loop in detail
 
 ### 1. Parent selection
 
@@ -394,7 +394,7 @@ It shows:
 
 ---
 
-## Cloud GPU execution
+## [Cloud GPU execution](#cloud-gpu-execution)
 
 Evolyth can execute the same RP through Google Cloud Run jobs by using the `cloud-run` executor.
 
