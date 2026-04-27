@@ -59,6 +59,8 @@ The key design decision is that the AI agent is **not the system of record**. Th
 
 That makes Evolyth closer to a small autonomous lab than to a one-shot code generator.
 
+Specifically for demo we have created a test project [tiny-cifar](https://github.com/akaliutau/tiny-cifar.git)
+
 ---
 
 ## System Architecture
