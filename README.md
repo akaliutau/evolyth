@@ -82,7 +82,7 @@ This separation is the reason the loop stays debuggable. A failed reviewer does 
 
 ---
 
-## Evolution loop
+### Evolution loop
 
 <p align="center">
   <img src="docs/evolyth_diag_2_sm.jpg" alt="Evolyth system architecture" width="700">
@@ -105,7 +105,53 @@ select parent or queued mutation
 → enqueue recommended next mutations
 ```
 
-The loop is deliberately conservative. Evolyth is not trying to let an agent rewrite an entire repository. It is trying to produce **many small, comparable, evidence-backed experiments**.
+The loop is deliberately conservative - it increases stability. 
+Evolyth is not trying to let an agent rewrite an entire repository. It is trying to produce **many small, comparable, evidence-backed experiments**.
+
+---
+
+## [Research Problem contract](#research-problem-contract)
+
+Evolyth's prime input is a **Research Problem folder**.
+
+Minimum RP structure:
+
+```text
+my_rp/
+  goal_prompt.md      # objective and constraints for the model research task
+  train_eval.py       # executable training/evaluation entrypoint
+  model.py            # mutable model file, edited by the mutation agent
+```
+
+### Expected outputs
+
+The RP should write metrics and events under the run artifact directory. When the executor launches a run, it sets:
+
+```text
+ACR_RUN_ID=<run_id>
+ACR_ARTIFACT_DIR=<arena>/runs/<run_id>
+PYTHONUNBUFFERED=1
+```
+
+A typical run directory looks like this:
+
+```text
+.arena/runs/run_000001/
+  model.py
+  goal_prompt.md
+  metrics.json
+  events.jsonl
+  run_summary.md
+  stdout.txt
+  stderr.txt
+  manifest.json
+  context.md
+  mutation.json
+  ds_review.json
+```
+
+This artifact-first contract is what lets Evolyth recover from partial failures and inspect every experiment after the fact.
+
 
 ---
 
@@ -289,50 +335,6 @@ python cli.py --arena .arena evolve \
   --reviewer heuristic \
   -- --epochs 2 --max-steps 200
 ```
-
----
-
-## [Research Problem contract](#research-problem-contract)
-
-Evolyth's prime input is a **Research Problem folder**.
-
-Minimum RP structure:
-
-```text
-my_rp/
-  goal_prompt.md      # objective and constraints for the model research task
-  train_eval.py       # executable training/evaluation entrypoint
-  model.py            # mutable model file, edited by the mutation agent
-```
-
-### Expected outputs
-
-The RP should write metrics and events under the run artifact directory. When the executor launches a run, it sets:
-
-```text
-ACR_RUN_ID=<run_id>
-ACR_ARTIFACT_DIR=<arena>/runs/<run_id>
-PYTHONUNBUFFERED=1
-```
-
-A typical run directory looks like this:
-
-```text
-.arena/runs/run_000001/
-  model.py
-  goal_prompt.md
-  metrics.json
-  events.jsonl
-  run_summary.md
-  stdout.txt
-  stderr.txt
-  manifest.json
-  context.md
-  mutation.json
-  ds_review.json
-```
-
-This artifact-first contract is what lets Evolyth recover from partial failures and inspect every experiment after the fact.
 
 ---
 
